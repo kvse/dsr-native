@@ -432,6 +432,10 @@ public final class SettingsMenu {
         choice("fps", Strings.t("fps_t"), Strings.t("fps_auto_n") + " " + Strings.t("changes_now"),
                 new String[] {"30", "45", "60", "auto"},
                 new String[] {"30 fps", "45 fps", "60 fps", Strings.t("fps_auto")}, "60");
+        choice("min_fps", Strings.t("minfps_t"), Strings.t("minfps_n") + " " + Strings.t("changes_now"),
+                new String[] {"15", "20", "30"}, new String[] {"15 fps", "20 fps", "30 fps"}, "20");
+        choice("scale_filter", Strings.t("scalef_t"), Strings.t("scalef_n") + " " + Strings.t("changes_now"),
+                new String[] {"0", "1"}, new String[] {Strings.t("scalef_0"), Strings.t("scalef_1")}, "1");
         choice("present_mode", Strings.t("present_t"), Strings.t("changes_next"),
                 new String[] {"fifo", "mailbox"},
                 new String[] {Strings.t("present_vsync") + " " + Strings.t("default_mark"), Strings.t("present_mailbox")},

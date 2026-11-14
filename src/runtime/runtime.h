@@ -77,6 +77,8 @@ struct RuntimeConfig {
     // texture_mip_skip = 1: big BC textures (512x512 and up, with mip levels) are loaded without their most detailed
     // level: half the width and height, ~75% less data to convert, upload and sample; softer up close.
     int texture_mip_skip = 0;
+    // scale_filter: how the picture is enlarged to the screen. 0 = nearest (sharp pixels), 1 = bilinear (default)
+    int scale_filter = 1;
     // skip_intro = 1: the company logos at the start are skipped (straight to the title movie).
     bool skip_intro = false;
     int max_anisotropy = 0;  // limit on the game's anisotropic texture filtering (0 = the game's own level)

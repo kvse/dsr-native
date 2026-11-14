@@ -205,6 +205,37 @@ final class Strings {
                 "자동은 기기가 유지할 수 있는 60, 30, 20 FPS 중에서 고르며 게임 속도는 정상으로 유지합니다.",
                 "自动会根据设备的承受能力选择 60、30 或 20 FPS，并保持游戏正常速度。",
                 "自動會依裝置可維持的程度選擇 60、30 或 20 FPS，並保持遊戲正常速度。");
+        put("minfps_t", "Lowest auto frame rate", "Plus bas en mode Auto", "Niedrigste Auto-Bildrate",
+                "Frame rate minimo in Auto", "Mínimo en modo Auto", "Mínimo no modo Auto",
+                "Минимум в режиме Авто", "自動の最低フレームレート", "자동 최저 프레임 속도", "自动模式最低帧率", "自動模式最低幀率");
+        put("minfps_n", "Only with Auto: the slowest rate Auto may drop to. Lower looks smoother on weak devices, but the game runs slower.",
+                "Seulement avec Auto : le taux le plus bas qu'Auto peut atteindre. Plus bas = plus fluide sur les appareils faibles, mais jeu plus lent.",
+                "Nur bei Auto: die niedrigste Rate, auf die Auto fallen darf. Niedriger wirkt flüssiger auf schwachen Geräten, das Spiel läuft dafür langsamer.",
+                "Solo con Auto: la velocità più bassa a cui Auto può scendere. Più bassa = più fluida sui dispositivi deboli, ma gioco più lento.",
+                "Solo con Auto: la velocidad más baja a la que puede bajar Auto. Más baja = más fluida en equipos débiles, pero el juego va más lento.",
+                "Só com Auto: a menor taxa a que o Auto pode cair. Mais baixa = mais fluida em aparelhos fracos, mas o jogo fica mais lento.",
+                "Только для Авто: самая низкая частота, до которой может опускаться Авто. Ниже — плавнее на слабых устройствах, но игра замедляется.",
+                "自動のときのみ：自動が下げる最低のレートです。低いほど弱い機種で滑らかですが、ゲームは遅くなります。",
+                "자동일 때만: 자동이 내려갈 수 있는 최저 속도입니다. 낮을수록 약한 기기에서 부드럽지만 게임이 느려집니다.",
+                "仅自动模式：自动可降到的最低帧率。越低在弱机上越流畅，但游戏会变慢。",
+                "僅自動模式：自動可降到的最低幀率。越低在弱機上越流暢，但遊戲會變慢。");
+        put("scalef_t", "Upscale filter", "Filtre d'agrandissement", "Vergrößerungsfilter", "Filtro di ingrandimento",
+                "Filtro de ampliación", "Filtro de ampliação", "Фильтр увеличения", "拡大フィルター", "확대 필터", "放大滤镜", "放大濾鏡");
+        put("scalef_n", "Smooths the enlarged picture (bilinear) or keeps pixels sharp (nearest). Bicubic and FXAA need shaders: not yet.",
+                "Lisse l'image agrandie (bilinéaire) ou garde les pixels nets (proche). Bicubique et FXAA demandent des shaders : pas encore.",
+                "Glättet das vergrößerte Bild (bilinear) oder hält die Pixel scharf (nächster Nachbar). Bikubisch und FXAA brauchen Shader: noch nicht.",
+                "Leviga l'immagine ingrandita (bilineare) o mantiene i pixel nitidi (vicino). Bicubico e FXAA richiedono shader: non ancora.",
+                "Suaviza la imagen ampliada (bilineal) o mantiene los píxeles nítidos (vecino). Bicúbico y FXAA necesitan shaders: aún no.",
+                "Suaviza a imagem ampliada (bilinear) ou mantém os pixels nítidos (vizinho). Bicúbico e FXAA precisam de shaders: ainda não.",
+                "Сглаживает увеличенное изображение (билинейный) или сохраняет пиксели четкими (ближайший). Бикубический и FXAA требуют шейдеров: пока нет.",
+                "拡大画像を滑らかにします（バイリニア）。ピクセルを鮮明に保つ場合はニアレスト。バイキュービックとFXAAはシェーダーが必要で、まだ未対応です。",
+                "확대된 화면을 부드럽게(바이리니어) 또는 픽셀을 선명하게(니어리스트) 유지합니다. 바이큐빅과 FXAA는 셰이더가 필요해 아직 없습니다.",
+                "平滑放大后的画面（双线性），或保持像素锐利（最近邻）。双三次和FXAA需要着色器，暂不可用。",
+                "平滑放大後的畫面（雙線性），或保持像素銳利（最近鄰）。雙三次和FXAA需要著色器，暫不可用。");
+        put("scalef_0", "Nearest", "Pixels nets", "Nächster Nachbar", "Vicino", "Vecino más cercano", "Vizinho mais próximo",
+                "Ближайший", "ニアレスト", "니어리스트", "最近邻", "最近鄰");
+        put("scalef_1", "Bilinear", "Bilinéaire", "Bilinear", "Bilineare", "Bilineal", "Bilinear", "Билинейный",
+                "バイリニア", "바이리니어", "双线性", "雙線性");
         put("tab_graphics", "Graphics", "Graphismes", "Grafik", "Grafica", "Gráficos", "Gráficos", "Графика", "グラフィック",
                 "그래픽", "图形", "圖形");
         put("sec_game", "Game", "Jeu", "Spiel", "Gioco", "Juego", "Jogo", "Игра", "ゲーム", "게임", "游戏", "遊戲");
