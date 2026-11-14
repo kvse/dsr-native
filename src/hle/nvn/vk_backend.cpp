@@ -1273,6 +1273,8 @@ public:
         if (!EnsureSwapchain()) return;
         // Acquire, copy and present run on the recorder after this frame's commands; the render thread goes on.
         BeginCommands();
+        EnsureOverlay();
+        WarmupStep(25.0);
         PumpBcUploads();
         PresentJob pj;
         if (src) {
@@ -1317,6 +1319,116 @@ private:
                              nullptr, 1, &b);
     }
     // Recorder: acquires a swapchain image, copies the frame into it, submits slot i and presents.
+    // ---- progress overlay, drawn by the presenter -------------------------------------------------------------
+    // Two 1x1 images, white (0) and black (1), are blitted as rectangles; a glyph pixel is one rectangle.
+    VkImage ov_img_[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+    VkDeviceMemory ov_mem_[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+    bool ov_ready_ = false, ov_failed_ = false;
+
+    void EnsureOverlay() {
+        if (ov_ready_ || ov_failed_) return;
+        for (int i = 0; i < 2; i++) {
+            VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+            ci.imageType = VK_IMAGE_TYPE_2D;
+            ci.format = VK_FORMAT_R8G8B8A8_UNORM;
+            ci.extent = {1, 1, 1};
+            ci.mipLevels = 1;
+            ci.arrayLayers = 1;
+            ci.samples = VK_SAMPLE_COUNT_1_BIT;
+            ci.tiling = VK_IMAGE_TILING_OPTIMAL;
+            ci.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+            ci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+            ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            if (vkCreateImage(device_, &ci, nullptr, &ov_img_[i]) != VK_SUCCESS) {
+                ov_failed_ = true;
+                return;
+            }
+            VkMemoryRequirements req;
+            vkGetImageMemoryRequirements(device_, ov_img_[i], &req);
+            VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+            ai.allocationSize = req.size;
+            ai.memoryTypeIndex = FindMemory(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            if (vkAllocateMemory(device_, &ai, nullptr, &ov_mem_[i]) != VK_SUCCESS) {
+                ov_failed_ = true;
+                return;
+            }
+            vkBindImageMemory(device_, ov_img_[i], ov_mem_[i], 0);
+            VkClearColorValue colour{};
+            colour.float32[0] = colour.float32[1] = colour.float32[2] = i == 0 ? 1.0f : 0.0f;
+            colour.float32[3] = 1.0f;
+            const VkImage img = ov_img_[i];
+            Rec([img, colour](VkCommandBuffer cb) {
+                const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+                VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+                b.image = img;
+                b.subresourceRange = range;
+                b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+                b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+                b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr,
+                                     0, nullptr, 1, &b);
+                vkCmdClearColorImage(cb, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &colour, 1, &range);
+                b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                b.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+                b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+                b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+                vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr,
+                                     0, nullptr, 1, &b);
+            });
+        }
+        ov_ready_ = true;
+        LOGI(kTag, "progress overlay ready");
+    }
+
+    void OverlayRect(VkCommandBuffer cb, VkImage sc, int which, int x, int y, int w, int h) {
+        const int dw = int(sc_extent_.width), dh = int(sc_extent_.height);
+        if (w <= 0 || h <= 0 || x < 0 || y < 0 || x + w > dw || y + h > dh) return;
+        VkImageBlit b{};
+        b.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        b.srcOffsets[1] = {1, 1, 1};
+        b.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        b.dstOffsets[0] = {x, y, 0};
+        b.dstOffsets[1] = {x + w, y + h, 1};
+        vkCmdBlitImage(cb, ov_img_[which], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, sc, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                       1, &b, VK_FILTER_NEAREST);
+    }
+
+    // 3x5 pixel glyphs: '#' is a lit pixel.
+    static const char* const* GlyphRows(char c) {
+        static const char* const kDigits[10][5] = {
+            {"###", "#.#", "#.#", "#.#", "###"}, {".#.", "##.", ".#.", ".#.", "###"},
+            {"###", "..#", "###", "#..", "###"}, {"###", "..#", "###", "..#", "###"},
+            {"#.#", "#.#", "###", "..#", "..#"}, {"###", "#..", "###", "..#", "###"},
+            {"###", "#..", "###", "#.#", "###"}, {"###", "..#", "..#", "..#", "..#"},
+            {"###", "#.#", "###", "#.#", "###"}, {"###", "#.#", "###", "..#", "###"}};
+        static const char* const kPct[5] = {"#.#", "..#", ".#.", "#..", "#.#"};
+        static const char* const kSpace[5] = {"...", "...", "...", "...", "..."};
+        if (c >= '0' && c <= '9') return kDigits[c - '0'];
+        if (c == '%') return kPct;
+        return kSpace;
+    }
+    void DrawGlyphText(VkCommandBuffer cb, VkImage sc, const std::string& text, int x0, int y0, int px) {
+        const int adv = 4;  // 3 columns and a gap
+        for (size_t ci = 0; ci < text.size(); ci++) {
+            const char* const* rows = GlyphRows(text[ci]);
+            for (int r = 0; r < 5; r++)
+                for (int col = 0; col < 3; col++)
+                    if (rows[r][col] == '#')
+                        OverlayRect(cb, sc, 0, x0 + int(ci) * adv * px + col * px, y0 + r * px, px, px);
+        }
+    }
+    void DrawProgressBar(VkCommandBuffer cb, VkImage sc, int permille) {
+        const int dw = int(sc_extent_.width), dh = int(sc_extent_.height);
+        const int px = std::max(3, dh / 120), bw = dw * 2 / 5, bh = px * 3;
+        const int x0 = (dw - bw) / 2, y0 = dh - bh * 4;
+        const int pct = std::min(permille, 1000) / 10;
+        DrawGlyphText(cb, sc, std::to_string(pct) + "%", x0, y0 - px * 8, px);
+        OverlayRect(cb, sc, 1, x0 - px, y0 - px, bw + 2 * px, bh + 2 * px);  // black frame
+        OverlayRect(cb, sc, 0, x0, y0, bw * std::min(permille, 1000) / 1000, bh);  // white fill
+    }
+
     void PresentSlot(int i, const PresentJob& pj) {
         uint32_t idx = 0;
         VkResult r = vkAcquireNextImageKHR(device_, swapchain_, 1000000000ull, acquire_sem_, VK_NULL_HANDLE, &idx);
@@ -1357,8 +1469,13 @@ private:
             blit.dstOffsets[0] = {x, y, 0};
             blit.dstOffsets[1] = {x + w, y + h, 1};
             vkCmdBlitImage(cmd_, pj.src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, sc, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
-                           &blit, w == pj.sw && h == pj.sh ? VK_FILTER_NEAREST : VK_FILTER_LINEAR);
+                           &blit,
+                           w == pj.sw && h == pj.sh || dsr::GetRuntime().config.scale_filter == 0
+                               ? VK_FILTER_NEAREST
+                               : VK_FILTER_LINEAR);
         }
+        const int warm = warm_permille_.load();
+        if (ov_ready_ && warm >= 0) DrawProgressBar(cmd_, sc, warm);
         CmdImageBarrier(cmd_, sc, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
         SubmitSlot(i, acquire_sem_, render_sem_);
         VkPresentInfoKHR pi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
@@ -4148,25 +4265,50 @@ private:
         return out;
     }
     // Before the game starts: translates the recorded shaders that the disk cache does not have (at most 30 s).
+    // Warm-up runs a little at a time, once per presented frame (WarmupStep), so the screen keeps moving; the
+    // progress is drawn on the screen until the recorded shaders are all checked.
+    std::vector<WarmRec> warm_recs_;
+    size_t warm_pos_ = 0;
+    std::atomic<int> warm_permille_{-1};  // -1: nothing to show; 0..1000: progress drawn on the screen
+    std::chrono::steady_clock::time_point warm_t0_;
+    uint64_t total_warm_translated_ = 0;
+
     void WarmupShaders() {
-        const std::vector<WarmRec> recs = ReadWarm();
-        if (recs.empty()) return;
-        const auto t0 = std::chrono::steady_clock::now();
-        size_t missing = 0, translated = 0;
-        for (const WarmRec& w : recs) {
-            if (shader_disk_.count(w.key)) continue;
-            missing++;
-            if (std::chrono::steady_clock::now() - t0 > std::chrono::seconds(30)) break;
-            shader::TranslateResult r = shader::Translate(w.code.data(), w.code.size(), w.opt);
-            if (!r.ok) continue;
-            shader_disk_[w.key] = CachedShader{r.spirv, r.info};
-            AppendShaderCache(w.key, r);
-            translated++;
-        }
-        const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-        LOGI(kTag, "warm-up: %zu of %zu recorded shaders were missing; %zu translated before the game starts (%.1f s)",
-             missing, recs.size(), translated, secs);
+        warm_recs_ = ReadWarm();
+        warm_pos_ = 0;
+        if (warm_recs_.empty()) return;
+        warm_t0_ = std::chrono::steady_clock::now();
+        warm_permille_.store(0);
+        LOGI(kTag, "warm-up: %zu recorded shaders to check before the game is shown", warm_recs_.size());
     }
+    void WarmupStep(double budget_ms) {
+        if (warm_permille_.load() < 0) return;
+        const auto t0 = std::chrono::steady_clock::now();
+        while (warm_pos_ < warm_recs_.size()) {
+            const WarmRec& w = warm_recs_[warm_pos_++];
+            if (!shader_disk_.count(w.key)) {
+                shader::TranslateResult r = shader::Translate(w.code.data(), w.code.size(), w.opt);
+                if (r.ok) {
+                    shader_disk_[w.key] = CachedShader{r.spirv, r.info};
+                    AppendShaderCache(w.key, r);
+                    total_warm_translated_++;
+                }
+            }
+            if (std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() > budget_ms)
+                break;
+        }
+        if (warm_pos_ >= warm_recs_.size()) {
+            const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - warm_t0_).count();
+            LOGI(kTag, "warm-up: done, %llu shaders translated before the game (%.1f s)",
+                 (unsigned long long)total_warm_translated_, secs);
+            warm_permille_.store(-1);
+            warm_recs_.clear();
+            warm_recs_.shrink_to_fit();
+        } else {
+            warm_permille_.store(int(warm_pos_ * 1000 / warm_recs_.size()));
+        }
+    }
+
 
     Shader* GetShader(const ShaderCode& code, const shader::TranslateOptions& opt) {
         const uint32_t parts[6] = {uint32_t(code.hash), uint32_t(code.hash >> 32), opt.int_attrib_mask,
