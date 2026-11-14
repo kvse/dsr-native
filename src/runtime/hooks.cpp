@@ -1,5 +1,6 @@
 // Hooks on specific functions inside the game's main module, for the game builds listed in kBuilds (matched by
-// build id): 1.0.0 and the 1.0.3 update. They replace engine functions whose output is useful to us but goes
+// build id): 1.0.0 and the 1.0.3 update (two editions of it: title 010088F00820E000's and 01004AB00A260000's, the same
+// version with different programs). They replace engine functions whose output is useful to us but goes
 // nowhere in a retail build, and patch the frame rate and resolution. The places were found in 1.0.0 and matched
 // in 1.0.3 by their code (the same instructions around them, with addresses masked).
 #include <algorithm>
@@ -70,6 +71,14 @@ const GameBuild kBuilds[] = {
      0x69c638, 0x69c824, 0x711ff0, 0x69c684, 0x69c894, 0x711ff8,
      0x7f71d4, 0x7f72ec, 0x782dac, 60,
      0x356790, 0x1adf890},
+    // 1.0.3 of title 01004AB00A260000 (update v196608, buildinfo region DV): the same game and data as the other
+    // 1.0.3 with its code moved; matched from it, and the limiter's fields are the same.
+    {"df3766a2bb651a3e822828abf10b6f7b", "1.0.3", "20181026_101",
+     0x667900, 0xF0008088, 0xBD46ED08,
+     0x707090, 0, 0x2f7, 0x2e8, 0x2f5, 0x2f6, 0x2f8,
+     0x69c608, 0x69c7f4, 0x711ec8, 0x69c654, 0x69c864, 0x711ed0,
+     0x7f9ec8, 0x7f9fe0, 0x784660, 60,
+     0x356790, 0x1ae3890},
 };
 const GameBuild* g_build = nullptr;
 
@@ -80,15 +89,16 @@ const GameBuild* g_build = nullptr;
 // down a timer (this+0xe0) before closing the dialog: that step branches straight to its close path. Everything
 // else (loading, the title movie, press start) runs as before.
 struct LogoSkip {
-    const char* version;
+    const char* build_id;  // first hex digits of the build (GameBuild::build_id)
     uint64_t open[2];
     uint32_t open_insn[2];  // bl set_dialog_request (60, 1)
     uint64_t timer;         // ldr s1, [x19, #0xe0]
     uint64_t timer_done;    // the timer-expired path
 };
 const LogoSkip kLogoSkips[] = {
-    {"1.0.0", {0x6f1c30, 0x6f73e8}, {0x97fa3d6c, 0x97fa277e}, 0x6f7450, 0x6f746c},
-    {"1.0.3", {0x6ed0e4, 0x6f27fc}, {0x97fa3510, 0x97fa1f4a}, 0x6f2864, 0x6f2880},
+    {"5a797a3a", {0x6f1c30, 0x6f73e8}, {0x97fa3d6c, 0x97fa277e}, 0x6f7450, 0x6f746c},
+    {"6569410c", {0x6ed0e4, 0x6f27fc}, {0x97fa3510, 0x97fa1f4a}, 0x6f2864, 0x6f2880},
+    {"df3766a2", {0x6ecf7c, 0x6f268c}, {0x97fa355e, 0x97fa1f9a}, 0x6f26f4, 0x6f2710},
 };
 constexpr uint32_t kNop = 0xD503201F, kLdrS1Timer = 0xBD40E261;
 
@@ -117,7 +127,7 @@ void ApplyPerformanceMode(Runtime& rt, const GameBuild& b) {
 void SkipIntroLogos(Runtime& rt, const GameBuild& b) {
     const LogoSkip* p = nullptr;
     for (const LogoSkip& l : kLogoSkips)
-        if (!strcmp(l.version, b.version)) p = &l;
+        if (!strncmp(l.build_id, b.build_id, strlen(l.build_id))) p = &l;
     if (!p) return;
     struct Edit { uint64_t at; uint32_t from, to; };
     const Edit edits[] = {
@@ -409,7 +419,7 @@ void InstallGameHooks() {
             Trim(data);
             for (char* e = data + strlen(data); e > data && e[-1] == ' '; *--e = 0) {}
             for (const GameBuild& o : kBuilds)
-                if (&o != &b && strcmp(data, o.data_version) == 0)
+                if (strcmp(o.data_version, b.data_version) != 0 && strcmp(data, o.data_version) == 0)
                     LOGW("hooks", "the game's data files are version %s (DataVersion %s) but the program is %s: "
                          "install the matching data (the update's RomFS) or the game may misbehave", o.version, data,
                          b.version);
