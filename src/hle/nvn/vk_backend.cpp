@@ -24,7 +24,10 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <chrono>
+#include <cstdio>
 #include <cstring>
+#include <type_traits>
 #include <memory>
 #include <thread>
 #include <deque>
@@ -1572,6 +1575,8 @@ private:
         vkCreateSemaphore(device_, &sci, nullptr, &acquire_sem_);
         vkCreateSemaphore(device_, &sci, nullptr, &render_sem_);
         LoadPipelineCache();
+        LoadShaderCache();
+        WarmupShaders();
         init_failed_ = false;
         LOGI(kTag, "device ready (queue family %u)", family_);
         return true;
@@ -2400,6 +2405,7 @@ private:
     // background thread converts it (WorkPool helps), and the render thread records the copy a few frames later
     // (PumpBcUploads), at most kBcFrameBudget bytes per frame. Until the copy is recorded the texture is not drawn.
     static constexpr size_t kBcFrameBudget = size_t(24) << 20;
+    static constexpr size_t kBcSyncBytes = size_t(2) << 20;  // converted textures up to this size are not queued
 
     struct PendingLevel {
         size_t src_off = 0, n = 0, out_off = 0, out_bytes = 0;
@@ -2585,6 +2591,29 @@ private:
                 p->levels.push_back(L);
             }
         p->result_bytes = out;
+        // Small conversions are done right here and recorded now: a texture that is queued is drawn with a white
+        // stand-in until its copy lands, and those few frames read as flicker. Only big ones go to the thread.
+        if (out <= kBcSyncBytes && StreamRemaining() >= out + 1024) {
+            ConvertPending(*p);
+            p->done.store(true, std::memory_order_release);
+            Begin();
+            EndRendering();
+            const VkDeviceSize off = StreamAlloc(out, 16);
+            memcpy(stream_ptr_ + off, p->result.data(), out);
+            std::vector<VkBufferImageCopy> regions = p->regions;
+            for (VkBufferImageCopy& r : regions) r.bufferOffset += off;
+            Transition(img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+            Rec([regions = std::move(regions), buf = stream_, image = img.image](VkCommandBuffer cb) {
+                vkCmdCopyBufferToImage(cb, buf, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, uint32_t(regions.size()),
+                                       regions.data());
+            });
+            img.written = true;
+            img.pending = false;
+            uploads_++;
+            bc_converted_levels_ += p->levels.size();
+            bc_cache_hits_ += p->cache_hits;
+            return;
+        }
         img.pending = true;
         EnsureBcThread();
         {
@@ -3976,6 +4005,169 @@ private:
     // ======================================================================================================
     // shaders, layouts, pipelines
     // ======================================================================================================
+    // ---- persistent shader cache and warm-up ------------------------------------------------------------------
+    // Guest shaders are translated once. The translation (SPIR-V and shader info) is kept in
+    // cache/shader_cache.bin, keyed by the guest code's hash and the translation options, so it is the same on
+    // every run. Each translated shader's code and options are also kept in cache/shader_warm.bin; on the next
+    // start, WarmupShaders() translates the ones the disk cache lacks, before the game starts, so the game does not
+    // stop to translate them. Bump the versions when the translator's output or these layouts change.
+    static constexpr uint32_t kShaderCacheVersion = 1, kWarmVersion = 1;
+    struct CachedShader {
+        std::vector<uint32_t> spirv;
+        shader::ShaderInfo info;
+    };
+    std::unordered_map<std::vector<uint32_t>, CachedShader, VecHash> shader_disk_;
+    std::unordered_map<std::vector<uint32_t>, int, VecHash> warm_seen_;
+    bool shader_cache_writable_ = false;
+    uint64_t shader_cache_hits_ = 0, shader_cache_misses_ = 0;
+    struct WarmRec {
+        std::vector<uint32_t> key;
+        shader::TranslateOptions opt;
+        std::vector<uint8_t> code;
+    };
+
+    std::string CacheFile(const char* name) const {
+        const std::string& dir = dsr::GetRuntime().config.cache_dir;
+        return dir.empty() ? std::string() : dir + "/" + name;
+    }
+    static void WriteShaderRecord(FILE* f, const std::vector<uint32_t>& key, const std::vector<uint32_t>& spirv,
+                                  const shader::ShaderInfo& info) {
+        const uint32_t nwords = uint32_t(spirv.size()), info_size = uint32_t(sizeof(info));
+        fwrite(key.data(), 4, key.size(), f);
+        fwrite(&nwords, 4, 1, f);
+        fwrite(&info_size, 4, 1, f);
+        fwrite(&info, sizeof(info), 1, f);
+        fwrite(spirv.data(), 4, spirv.size(), f);
+    }
+    void RewriteShaderCache(const std::string& path) {
+        FILE* f = fopen(path.c_str(), "wb");
+        if (!f) {
+            shader_cache_writable_ = false;
+            return;
+        }
+        const char magic[8] = {'D', 'S', 'R', 'S', 'C', '0', '1', 0};
+        fwrite(magic, 1, 8, f);
+        fwrite(&kShaderCacheVersion, 4, 1, f);
+        for (const auto& e : shader_disk_) WriteShaderRecord(f, e.first, e.second.spirv, e.second.info);
+        fclose(f);
+        shader_cache_writable_ = true;
+    }
+    void LoadShaderCache() {
+        static_assert(std::is_trivially_copyable<shader::ShaderInfo>::value, "ShaderInfo must be plain data");
+        const std::string path = CacheFile("shader_cache.bin");
+        if (path.empty()) return;
+        const char magic[8] = {'D', 'S', 'R', 'S', 'C', '0', '1', 0};
+        bool damaged = true;
+        if (FILE* f = fopen(path.c_str(), "rb")) {
+            char m[8];
+            uint32_t ver = 0;
+            if (fread(m, 1, 8, f) == 8 && memcmp(m, magic, 8) == 0 && fread(&ver, 4, 1, f) == 1 &&
+                ver == kShaderCacheVersion) {
+                damaged = false;
+                for (;;) {
+                    uint32_t key[6], nwords = 0, info_size = 0;
+                    if (fread(key, 4, 6, f) != 6) break;  // clean end of file
+                    if (fread(&nwords, 4, 1, f) != 1 || fread(&info_size, 4, 1, f) != 1) {
+                        damaged = true;
+                        break;
+                    }
+                    CachedShader c;
+                    if (info_size != sizeof(c.info) || nwords == 0 || nwords > (1u << 22)) {
+                        damaged = true;
+                        break;
+                    }
+                    c.spirv.resize(nwords);
+                    if (fread(&c.info, sizeof(c.info), 1, f) != 1 || fread(c.spirv.data(), 4, nwords, f) != nwords) {
+                        damaged = true;
+                        break;
+                    }
+                    shader_disk_.emplace(std::vector<uint32_t>(key, key + 6), std::move(c));
+                }
+            }
+            fclose(f);
+        }
+        if (damaged) {
+            shader_disk_.clear();  // missing, another version or damaged: start a fresh file
+            RewriteShaderCache(path);
+        } else {
+            shader_cache_writable_ = true;
+        }
+        LOGI(kTag, "shader cache: %zu translated shaders loaded", shader_disk_.size());
+    }
+    void AppendShaderCache(const std::vector<uint32_t>& key, const shader::TranslateResult& r) {
+        if (!shader_cache_writable_) return;
+        if (FILE* f = fopen(CacheFile("shader_cache.bin").c_str(), "ab")) {
+            WriteShaderRecord(f, key, r.spirv, r.info);
+            fclose(f);
+        }
+    }
+    // Shaders translated in this run: their code and options, for the warm-up of the next start.
+    void RememberForWarmup(const ShaderCode& code, const shader::TranslateOptions& opt, const std::vector<uint32_t>& key) {
+        static_assert(std::is_trivially_copyable<shader::TranslateOptions>::value, "options are stored as bytes");
+        if (!warm_seen_.emplace(key, 1).second) return;
+        const std::string path = CacheFile("shader_warm.bin");
+        FILE* f = path.empty() ? nullptr : fopen(path.c_str(), "ab");
+        if (!f) return;
+        if (ftell(f) == 0) {
+            const char magic[8] = {'D', 'S', 'R', 'W', 'U', '0', '1', 0};
+            fwrite(magic, 1, 8, f);
+            fwrite(&kWarmVersion, 4, 1, f);
+        }
+        const uint32_t opt_size = uint32_t(sizeof(opt)), code_size = uint32_t(code.code.size());
+        fwrite(key.data(), 4, key.size(), f);
+        fwrite(&opt_size, 4, 1, f);
+        fwrite(&code_size, 4, 1, f);
+        fwrite(&opt, sizeof(opt), 1, f);
+        fwrite(code.code.data(), 1, code.code.size(), f);
+        fclose(f);
+    }
+    std::vector<WarmRec> ReadWarm() {
+        std::vector<WarmRec> out;
+        const std::string path = CacheFile("shader_warm.bin");
+        FILE* f = path.empty() ? nullptr : fopen(path.c_str(), "rb");
+        if (!f) return out;
+        const char magic[8] = {'D', 'S', 'R', 'W', 'U', '0', '1', 0};
+        char m[8];
+        uint32_t ver = 0;
+        if (fread(m, 1, 8, f) == 8 && memcmp(m, magic, 8) == 0 && fread(&ver, 4, 1, f) == 1 && ver == kWarmVersion) {
+            for (;;) {
+                uint32_t k[6], opt_size = 0, code_size = 0;
+                if (fread(k, 4, 6, f) != 6) break;
+                if (fread(&opt_size, 4, 1, f) != 1 || fread(&code_size, 4, 1, f) != 1) break;
+                WarmRec w;
+                w.key.assign(k, k + 6);
+                if (opt_size != sizeof(w.opt) || code_size == 0 || code_size > (1u << 24)) break;  // another version
+                if (fread(&w.opt, sizeof(w.opt), 1, f) != 1) break;
+                w.code.resize(code_size);
+                if (fread(w.code.data(), 1, code_size, f) != code_size) break;
+                warm_seen_.emplace(w.key, 1);
+                out.push_back(std::move(w));
+            }
+        }
+        fclose(f);
+        return out;
+    }
+    // Before the game starts: translates the recorded shaders that the disk cache does not have (at most 30 s).
+    void WarmupShaders() {
+        const std::vector<WarmRec> recs = ReadWarm();
+        if (recs.empty()) return;
+        const auto t0 = std::chrono::steady_clock::now();
+        size_t missing = 0, translated = 0;
+        for (const WarmRec& w : recs) {
+            if (shader_disk_.count(w.key)) continue;
+            missing++;
+            if (std::chrono::steady_clock::now() - t0 > std::chrono::seconds(30)) break;
+            shader::TranslateResult r = shader::Translate(w.code.data(), w.code.size(), w.opt);
+            if (!r.ok) continue;
+            shader_disk_[w.key] = CachedShader{r.spirv, r.info};
+            AppendShaderCache(w.key, r);
+            translated++;
+        }
+        const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        LOGI(kTag, "warm-up: %zu of %zu recorded shaders were missing; %zu translated before the game starts (%.1f s)",
+             missing, recs.size(), translated, secs);
+    }
+
     Shader* GetShader(const ShaderCode& code, const shader::TranslateOptions& opt) {
         const uint32_t parts[6] = {uint32_t(code.hash), uint32_t(code.hash >> 32), opt.int_attrib_mask,
                                    opt.signed_attrib_mask, uint32_t(opt.gl_depth_range),
@@ -3992,7 +4184,22 @@ private:
             return &it->second;
         }
         Shader& s = shaders_[key];
-        shader::TranslateResult r = shader::Translate(code.code.data(), code.code.size(), opt);
+        shader::TranslateResult r;
+        const auto disk = shader_disk_.find(key);
+        if (disk != shader_disk_.end()) {
+            r.ok = true;
+            r.spirv = disk->second.spirv;
+            r.info = disk->second.info;
+            shader_cache_hits_++;
+        } else {
+            r = shader::Translate(code.code.data(), code.code.size(), opt);
+            shader_cache_misses_++;
+            if (r.ok) {
+                shader_disk_[key] = CachedShader{r.spirv, r.info};
+                AppendShaderCache(key, r);
+                RememberForWarmup(code, opt, key);
+            }
+        }
         if (!r.ok) {
             s.error = r.error;
             if (shader_failures_logged_++ < 24)
