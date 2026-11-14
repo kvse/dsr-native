@@ -64,6 +64,7 @@ bool Module::HookFunction(uint64_t off, void* host_fn, std::string* err) {
         return false;
     }
     arch::FlushICache(reinterpret_cast<void*>(addr), sizeof(patch));
+    patched_.push_back({off, off + sizeof(patch)});
     return true;
 }
 
@@ -98,6 +99,31 @@ bool Module::PatchInstruction(uint64_t off, uint32_t expected, uint32_t replacem
         return false;
     }
     arch::FlushICache(reinterpret_cast<void*>(addr), 4);
+    patched_.push_back({off, off + 4});
+    return true;
+}
+
+bool Module::Patched(uint64_t off, size_t size) const {
+    for (const auto& [b, e] : patched_)
+        if (off < e && off + size > b) return true;
+    return false;
+}
+
+bool Module::WriteReadOnly(uint64_t off, const void* data, size_t size) {
+    const uint64_t ro_end = nso_->data.mem_offset;  // .text and .rodata come before .data
+    if (size == 0 || off >= ro_end || size > ro_end - off) return false;
+    const uintptr_t addr = base_ + off;
+    const uintptr_t page_lo = addr & ~(host_page_ - 1);
+    const uintptr_t page_hi = (addr + size + host_page_ - 1) & ~(host_page_ - 1);
+    // Other threads may be running code on these pages: they stay executable throughout.
+    if (mprotect(reinterpret_cast<void*>(page_lo), page_hi - page_lo, PROT_READ | PROT_WRITE | PROT_EXEC) != 0)
+        return false;
+    memcpy(reinterpret_cast<void*>(addr), data, size);
+    for (uintptr_t p = page_lo; p < page_hi; p += host_page_) {
+        const bool text = p - base_ < uint64_t(nso_->text.mem_offset) + nso_->text.size;
+        mprotect(reinterpret_cast<void*>(p), host_page_, text ? PROT_READ | PROT_EXEC : PROT_READ);
+    }
+    arch::FlushICache(reinterpret_cast<void*>(addr), size);
     return true;
 }
 

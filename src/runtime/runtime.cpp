@@ -1,4 +1,5 @@
 #include "runtime/runtime.h"
+#include "runtime/cheats.h"
 
 #include <cxxabi.h>
 #include <pthread.h>
@@ -102,6 +103,7 @@ bool LoadGame(const RuntimeConfig& cfg, std::string* err) {
         return false;
     }
     InstallGameHooks();
+    if (!rt.config.dry_run) cheats::Start(rt.config.cheats_dir);
     return true;
 }
 

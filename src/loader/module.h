@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <functional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "loader/nso.h"
@@ -59,6 +60,12 @@ public:
     // Replaces one instruction in .text, only if it currently is `expected`. Before guest code runs.
     bool PatchInstruction(uint64_t image_offset, uint32_t expected, uint32_t replacement, std::string* err);
 
+    // True if [image_offset, +size) overlaps code changed by HookFunction / PatchInstruction.
+    bool Patched(uint64_t image_offset, size_t size) const;
+    // Writes into the read-only part of the image (.text / .rodata) while the game runs (cheat codes): the pages are
+    // made writable and executable for the copy, then restored. False if outside or the protection cannot change.
+    bool WriteReadOnly(uint64_t image_offset, const void* data, size_t size);
+
     // A zeroed, writable host page mapped right after the image (within ADRP range of all guest code): for
     // variables that patched guest code reads (e.g. the game's time step).
     uintptr_t ScratchPage() const { return base_ + size_; }
@@ -78,6 +85,7 @@ private:
     void* thunk_block_ = nullptr;
     size_t thunk_block_size_ = 0;
     std::vector<void*> dummy_data_;
+    std::vector<std::pair<uint64_t, uint64_t>> patched_;  // [begin, end) image offsets
 };
 
 // Host page size (4K or 16K on Android).

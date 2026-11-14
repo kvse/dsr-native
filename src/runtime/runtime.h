@@ -14,6 +14,7 @@ struct RuntimeConfig {
     std::string game_dir;     // directory holding exefs/ and the romfs contents (dvdbnd*.bdt, ...)
     std::string save_dir;     // writable directory for save data
     std::string cache_dir;    // writable directory for caches (shaders etc.)
+    std::string cheats_dir;   // cheat files (<build id>.txt, runtime/cheats.h); empty = no cheats
     bool dry_run = false;     // map + relocate + bind only, never execute guest code
     bool abort_on_unimplemented = false;
     bool docked = false;      // nn::oe::GetOperationMode: false = handheld (720p), true = console

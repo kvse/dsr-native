@@ -23,6 +23,7 @@
 static int g_failures = 0;
 #include "hle/nvn/etc_encode.h"
 #include "hle/nvn/parallel.h"
+#include "runtime/cheat_vm.h"
 
 #define CHECK(cond)                                                              \
     do {                                                                         \
@@ -617,6 +618,117 @@ static void TestEtcEncode() {
     CHECK(once);
 }
 
+// Cheat codes (Atmosphère format): parsing and the machine, on a fake memory with main at 0x1000 and the heap at
+// 0x100000.
+namespace {
+class FakeMemory final : public dsr::cheats::Memory {
+public:
+    std::vector<uint8_t> main = std::vector<uint8_t>(0x1000), heap = std::vector<uint8_t>(0x1000);
+    uint64_t RegionBase(int r) override { return r == 0 ? 0x1000 : r == 1 ? 0x100000 : 0; }
+    uint8_t* At(uint64_t a, size_t n) {
+        if (a >= 0x1000 && a + n <= 0x2000) return &main[a - 0x1000];
+        if (a >= 0x100000 && a + n <= 0x101000) return &heap[a - 0x100000];
+        return nullptr;
+    }
+    bool Read(uint64_t a, void* out, size_t n) override {
+        uint8_t* p = At(a, n);
+        if (p) memcpy(out, p, n);
+        return p != nullptr;
+    }
+    bool Write(uint64_t a, const void* in, size_t n) override {
+        uint8_t* p = At(a, n);
+        if (p) memcpy(p, in, n);
+        return p != nullptr;
+    }
+    void Log(const std::string&) override {}
+    uint32_t U32(uint64_t a) {
+        uint32_t v = 0;
+        Read(a, &v, 4);
+        return v;
+    }
+};
+}  // namespace
+
+static void TestCheats() {
+    using namespace dsr::cheats;
+    const std::string file =
+        "Title line\r\n"
+        "{Master}\r\n"
+        "04000000 00000010 0000002A\r\n"  // main+0x10 = 42 (4 bytes)
+        "\n"
+        "[Pointer]\n"
+        "58000000 00000100\n"            // r0 = [main+0x100] (8 bytes)
+        "78000000 00000020\n"            // r0 += 0x20
+        "64000000 00000000 12345678\n"   // [r0] = 0x12345678 (4 bytes)
+        "[Keys]\n"
+        "80000001\n"                     // if A held
+        "04100000 00000008 00000001\n"   //   heap+8 = 1
+        "21000000\n"                     // else
+        "04100000 00000008 00000002\n"   //   heap+8 = 2
+        "20000000\n"
+        "[Loop] 30000000 00000003 04100000 0000000C 00000000 3100000\n"
+        "[Bad]\n"
+        "0400000 00000010\n";
+    std::vector<Cheat> c = Parse(file);
+    CHECK(c.size() == 5);
+    CHECK(c[0].master && c[0].name == "Master" && c[0].error.empty() && c[0].code.size() == 3);
+    CHECK(c[1].name == "Pointer" && c[1].error.empty() && c[1].code.size() == 7);
+    CHECK(c[2].error.empty() && OpenBlocks(c[2].code) == 0);
+    CHECK(!c[3].error.empty());  // "3100000" is 7 digits
+    CHECK(!c[4].error.empty());
+    CHECK(file.substr(c[1].begin, c[1].end - c[1].begin) == c[1].text && c[1].text.rfind("[Pointer]", 0) == 0);
+
+    FakeMemory mem;
+    const uint64_t ptr = 0x100100;
+    memcpy(&mem.main[0x100], &ptr, 8);
+    // Cheats run as one program (as on the Switch): registers carry over from one cheat to the next.
+    std::vector<uint32_t> prog = c[0].code;
+    prog.insert(prog.end(), c[1].code.begin(), c[1].code.end());
+    Vm vm;
+    CHECK(vm.Execute(prog, mem, 0, 0));
+    CHECK(mem.U32(0x1010) == 42);
+    CHECK(mem.U32(0x100120) == 0x12345678);
+    CHECK(vm.Register(0) == 0x100120);
+    CHECK(vm.Execute(c[2].code, mem, 0, 0));
+    CHECK(mem.U32(0x100008) == 2);  // A not held: else branch
+    CHECK(vm.Execute(c[2].code, mem, 1, 0));
+    CHECK(mem.U32(0x100008) == 1);
+
+    // Loop: heap+0x10.. 4 words = 7 via register 1 as a moving pointer (type A with increment).
+    std::vector<uint32_t> loop = {0x40010000, 0x00000000, 0x00100010,  // r1 = 0x100010
+                                  0x30020000, 0x00000004,              // loop r2 = 4
+                                  0x40030000, 0x00000000, 0x00000007,  //   r3 = 7
+                                  0xA4311000,                          //   [r1] = r3 (4 bytes), r1 += 4
+                                  0x31020000};                         // end loop
+    CHECK(Validate(loop).empty());
+    CHECK(vm.Execute(loop, mem, 0, 0));
+    for (int i = 0; i < 4; i++) CHECK(mem.U32(0x100010 + i * 4) == 7);
+    CHECK(mem.U32(0x100020) == 0);
+
+    // Register conditional (C0) against a static value, 9 arithmetic with an immediate, nested blocks.
+    std::vector<uint32_t> cond = {0x40050000, 0x00000000, 0x00000005,      // r5 = 5
+                                  0x94055100, 0x00000003,                  // r5 = r5 + 3 (4 bytes)
+                                  0xC0455400, 0x00000008,                  // if r5 == 8
+                                  0x80000002,                              //   if B held
+                                  0x04100000, 0x00000030, 0x00000063,      //     heap+0x30 = 99
+                                  0x20000000,
+                                  0x04100000, 0x00000034, 0x00000058,      //   heap+0x34 = 88
+                                  0x20000000};
+    CHECK(Validate(cond).empty());
+    CHECK(vm.Execute(cond, mem, 0, 0));
+    CHECK(mem.U32(0x100030) == 0 && mem.U32(0x100034) == 88);
+    CHECK(vm.Execute(cond, mem, 2, 0));
+    CHECK(mem.U32(0x100030) == 99);
+
+    // Outside the memory: counted, nothing breaks; an endless loop stops at the step limit.
+    const size_t before = vm.failed_writes();
+    CHECK(vm.Execute({0x04000000, 0x00009000, 0x00000001}, mem, 0, 0));
+    CHECK(vm.failed_writes() == before + 1);
+    CHECK(!vm.Execute({0x30000000, 0xFFFFFFFF, 0x31000000}, mem, 0, 0, 1000));
+    CHECK(!Validate({0x04000000, 0x00000010}).empty());  // cut off
+    CHECK(!Validate({0xE0000000}).empty());              // unknown type
+}
+
 int main() {
     struct T { const char* name; void (*fn)(); } tests[] = {
         {"lz4", TestLz4},
@@ -628,6 +740,7 @@ int main() {
         {"shader_translator", TestShaderTranslator},
         {"block_linear", TestBlockLinear},
         {"etc_encode", TestEtcEncode},
+        {"cheats", TestCheats},
 #if defined(__aarch64__)
         {"abi_arm64", TestAbi},
 #endif
