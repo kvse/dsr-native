@@ -522,6 +522,7 @@ void LoadSettings(const std::string& path, dsr::RuntimeConfig* cfg) {
             else if (!strcmp(key, "mali_barriers")) cfg->mali_barriers = v != 0;
             else if (!strcmp(key, "performance_mode")) cfg->performance_mode = v != 0;
             else if (!strcmp(key, "texture_mip_skip")) cfg->texture_mip_skip = std::clamp(v, 0, 1);
+            else if (!strcmp(key, "scale_filter")) cfg->scale_filter = std::clamp(v, 0, 1);
             else if (!strcmp(key, "gamma")) {
                 const float g = float(atof(value));
                 cfg->gamma = g >= 0.5f && g <= 3.0f ? g : 1.0f;
@@ -987,6 +988,12 @@ jboolean JNICALL MenuApply(JNIEnv* env, jclass, jstring jkey, jstring jvalue) {
         now = true;
     } else if (key == "touch_camera_speed") {
         g_touch.camera_speed = std::clamp(float(atof(value.c_str())), 0.1f, 10.0f);
+        now = true;
+    } else if (key == "scale_filter") {  // read by the presenter every frame
+        c.scale_filter = std::clamp(atoi(value.c_str()), 0, 1);
+        now = true;
+    } else if (key == "min_fps") {  // the lowest rate fps = auto may use; read by the limiter every frame
+        c.min_fps = std::clamp(atoi(value.c_str()), 15, 30);
         now = true;
     } else if (key == "exposure") {
         const float e = float(atof(value.c_str()));
