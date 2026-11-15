@@ -384,6 +384,7 @@ bool SaveSetting(const std::string& path, const std::string& key, const std::str
 
 // settings.txt beside the game folder: "key = value" lines, '#' comments. Written with defaults if missing.
 void LoadSettings(const std::string& path, dsr::RuntimeConfig* cfg) {
+    cfg->hud_full_res = true;  // on unless settings.txt says hud_full_res = 0
     FILE* f = fopen(path.c_str(), "r");
     if (!f) {
         if (FILE* w = fopen(path.c_str(), "w")) {
@@ -439,7 +440,7 @@ void LoadSettings(const std::string& path, dsr::RuntimeConfig* cfg) {
         }
     } else {
         bool have_present_mode = false, have_face_buttons = false, have_gpu_driver = false, have_bc_enabler = false;
-        bool have_touch = false, have_aspect = false;
+        bool have_touch = false, have_aspect = false, have_hud_full_res = false;
         int settings_version = 1;
         char line[256];
         while (fgets(line, sizeof(line), f)) {
@@ -462,13 +463,17 @@ void LoadSettings(const std::string& path, dsr::RuntimeConfig* cfg) {
             else if (!strcmp(key, "shader_depth_test")) cfg->shader_depth_test = v != 0;
             else if (!strcmp(key, "hole_test")) cfg->hole_test = v;
             else if (!strcmp(key, "hud_box")) cfg->hud_box = v != 0;
+            else if (!strcmp(key, "hud_full_res")) {
+                cfg->hud_full_res = v != 0;
+                have_hud_full_res = true;
+            }
             else if (!strcmp(key, "compositor_scaling")) cfg->compositor_scaling = v != 0;
             else if (!strcmp(key, "max_anisotropy")) cfg->max_anisotropy = v;
             else if (!strcmp(key, "shadow_compare")) cfg->shadow_compare = std::clamp(v, 0, 3);
             else if (!strcmp(key, "game_hooks")) cfg->game_hooks = v != 0;
             else if (!strcmp(key, "skip_intro")) cfg->skip_intro = v != 0;
             else if (!strcmp(key, "render_pass_objects")) cfg->render_pass_objects = v != 0;
-            else if (!strcmp(key, "render_scale")) cfg->render_scale = std::clamp(float(atof(value)), 0.5f, 1.0f);
+            else if (!strcmp(key, "render_scale")) cfg->render_scale = std::clamp(float(atof(value)), 0.30f, 1.0f);
             else if (!strcmp(key, "language")) {
                 // The game's languages (nn::settings codes it recognises); the settings menu lists the same.
                 static const char* const kLanguages[] = {"en-US", "fr", "de", "it", "es", "pt", "ru", "ja", "ko",
@@ -522,7 +527,10 @@ void LoadSettings(const std::string& path, dsr::RuntimeConfig* cfg) {
             } else if (!strcmp(key, "settings_version")) settings_version = v;
             else if (!strcmp(key, "mali_barriers")) cfg->mali_barriers = v != 0;
             else if (!strcmp(key, "performance_mode")) cfg->performance_mode = v != 0;
+            else if (!strcmp(key, "shadow_quality")) cfg->shadow_quality = std::clamp(v, 0, 3);
+            else if (!strcmp(key, "low_effects")) cfg->low_effects = v != 0;
             else if (!strcmp(key, "texture_mip_skip")) cfg->texture_mip_skip = std::clamp(v, 0, 1);
+            else if (!strcmp(key, "scale_filter")) cfg->scale_filter = std::clamp(v, 0, 1);
             else if (!strcmp(key, "gamma")) {
                 const float g = float(atof(value));
                 cfg->gamma = g >= 0.5f && g <= 3.0f ? g : 1.0f;
@@ -581,6 +589,14 @@ void LoadSettings(const std::string& path, dsr::RuntimeConfig* cfg) {
                 fclose(w);
                 LOGI(kTag, "settings: added the touch controls settings to %s", path.c_str());
             }
+        if (!have_hud_full_res)
+            if (FILE* w = fopen(path.c_str(), "a")) {
+                fputs("\n# hud_full_res: 1 = the game's HUD, menus and text are drawn at the screen's full resolution\n"
+                      "# (sharp text at any render_scale); 0 = drawn in the game's own (smaller) frame\n"
+                      "hud_full_res = 1\n", w);
+                fclose(w);
+                LOGI(kTag, "settings: added hud_full_res to %s", path.c_str());
+            }
         if (!have_gpu_driver)
             if (FILE* w = fopen(path.c_str(), "a")) {
                 fputs("\n" GPU_DRIVER_HELP "gpu_driver = system\n", w);
@@ -606,6 +622,8 @@ void LoadSettings(const std::string& path, dsr::RuntimeConfig* cfg) {
     if (!g_custom_game_dir.empty()) LOGI(kTag, "settings: game_dir %s", g_custom_game_dir.c_str());
     LOGI(kTag, "settings: touch controls %s, opacity %.2f, camera speed %.2f%s", g_touch.enabled ? "on" : "off",
          g_touch.opacity, g_touch.camera_speed, g_touch.camera_invert ? ", camera inverted" : "");
+    LOGI(kTag, "settings: hud_full_res %d, shadow_quality %d, low_effects %d", int(cfg->hud_full_res), cfg->shadow_quality,
+         int(cfg->low_effects));
     if (!cfg->shader_depth_test) LOGI(kTag, "settings: shader_depth_test off");
     if (cfg->hole_test || cfg->lrz_workaround)
         LOGI(kTag, "settings: hole_test %d, lrz_workaround %d", cfg->hole_test, int(cfg->lrz_workaround));
@@ -988,6 +1006,15 @@ jboolean JNICALL MenuApply(JNIEnv* env, jclass, jstring jkey, jstring jvalue) {
         now = true;
     } else if (key == "touch_camera_speed") {
         g_touch.camera_speed = std::clamp(float(atof(value.c_str())), 0.1f, 10.0f);
+        now = true;
+    } else if (key == "scale_filter") {  // read by the presenter every frame
+        c.scale_filter = std::clamp(atoi(value.c_str()), 0, 1);
+        now = true;
+    } else if (key == "hud_full_res") {  // read by the presenter every frame
+        c.hud_full_res = atoi(value.c_str()) != 0;
+        now = true;
+    } else if (key == "min_fps") {  // the lowest rate fps = auto may use; read by the limiter every frame
+        c.min_fps = std::clamp(atoi(value.c_str()), 15, 30);
         now = true;
     } else if (key == "exposure") {
         const float e = float(atof(value.c_str()));

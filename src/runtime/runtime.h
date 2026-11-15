@@ -42,9 +42,14 @@ struct RuntimeConfig {
     std::string aspect_ratio = "16:9";
     float screen_aspect = 0;  // width / height of the screen (Android: the window), 0 = unknown
     bool hud_box = true;      // other aspect ratios: keep the HUD and menus in a centred 16:9 box
+    // hud_full_res = 1: the game's HUD and menus (its blended 2D layer) are drawn into a screen-sized image on top of
+    // the enlarged 3D picture, instead of into the game's frame (render size) that the screen then stretches: text
+    // and icons stay sharp at any render_scale / aspect_ratio. Costs one enlarging blit and one screen-sized copy per
+    // frame; it only applies when the screen is at least 1.2x the game's frame.
+    bool hud_full_res = true;
     int render_width = 1280;  // the game's render size once aspect_ratio and render_scale are applied
     int render_height = 720;
-    float render_scale = 1.0f;  // settings render_scale: 0.5 - 1.0 of the game's 720-line resolution
+    float render_scale = 1.0f;  // settings render_scale: 0.30 - 1.0 of the game's 720-line resolution
     // GPU driver: settings.txt `gpu_driver` (a file in DSRNative/drivers, or "system"). The Android front end
     // copies (or unzips) it into the app's private folder: gpu_driver_dir (ends in '/') holds gpu_driver_lib.
     // Empty gpu_driver_lib: the system driver.
@@ -74,9 +79,18 @@ struct RuntimeConfig {
     // performance_mode = 1: the engine's own lower-quality options: low-quality effects, 1024x1024 shadow maps instead
     // of 2048x2048 (read at start-up). The menu also sets render_scale 0.75 when it is turned on.
     bool performance_mode = false;
+    // shadow_quality: 0 = no shadows (the shadow map pass is not drawn at all and lookups always say "lit"),
+    // 1 = 512x512 maps, 2 = 1024x1024, 3 = 2048x2048 (the game's own; default). performance_mode with the default
+    // gives 1024 as before.
+    int shadow_quality = 3;
+    // low_effects = 1: the engine's low-quality effects path (smoke, fog, glow resolved at lower cost), without the
+    // rest of performance_mode.
+    bool low_effects = false;
     // texture_mip_skip = 1: big BC textures (512x512 and up, with mip levels) are loaded without their most detailed
     // level: half the width and height, ~75% less data to convert, upload and sample; softer up close.
     int texture_mip_skip = 0;
+    // scale_filter: how the picture is enlarged to the screen. 0 = nearest (sharp pixels), 1 = bilinear (default)
+    int scale_filter = 1;
     // skip_intro = 1: the company logos at the start are skipped (straight to the title movie).
     bool skip_intro = false;
     int max_anisotropy = 0;  // limit on the game's anisotropic texture filtering (0 = the game's own level)

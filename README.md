@@ -46,7 +46,7 @@ I have yet to test later areas in the game so don't expect performance to be ent
 - [x] User-selected game directory
 - [x] Floating GUI (Hold - and + buttons for one full second) with various settings such as FPS cap, aspect ratio, frame presentation, etc..
 - [x] Custom driver support
-- [x] Render scale / Graphics options
+- [x] Render scale (30% - 100%) / Graphics options (shadows off/512/1024/2048, low-quality effects)
 - [x] Several language options
 
 ## Roadmap

@@ -432,6 +432,12 @@ public final class SettingsMenu {
         choice("fps", Strings.t("fps_t"), Strings.t("fps_auto_n") + " " + Strings.t("changes_now"),
                 new String[] {"30", "45", "60", "auto"},
                 new String[] {"30 fps", "45 fps", "60 fps", Strings.t("fps_auto")}, "60");
+        choice("min_fps", Strings.t("minfps_t"), Strings.t("minfps_n") + " " + Strings.t("changes_now"),
+                new String[] {"15", "20", "30"}, new String[] {"15 fps", "20 fps", "30 fps"}, "20");
+        choice("scale_filter", Strings.t("scalef_t"), Strings.t("scalef_n") + " " + Strings.t("changes_now"),
+                new String[] {"0", "1"}, new String[] {Strings.t("scalef_0"), Strings.t("scalef_1")}, "1");
+        toggle("hud_full_res", Strings.t("hudres_t"), Strings.t("hudres_n") + " " + Strings.t("changes_now"), "1", "0",
+                "1");
         choice("present_mode", Strings.t("present_t"), Strings.t("changes_next"),
                 new String[] {"fifo", "mailbox"},
                 new String[] {Strings.t("present_vsync") + " " + Strings.t("default_mark"), Strings.t("present_mailbox")},
@@ -448,6 +454,11 @@ public final class SettingsMenu {
         toggle("performance_mode", Strings.t("perf_t"), Strings.t("perf_n") + " " + Strings.t("changes_next"), "1", "0",
                 "0");
         renderScale();  // performance mode sets 75%; it can be moved freely afterwards
+        choice("shadow_quality", Strings.t("shadow_t"), Strings.t("shadow_n") + " " + Strings.t("changes_next"),
+                new String[] {"3", "2", "1", "0"},
+                new String[] {Strings.t("q_high"), Strings.t("q_medium"), Strings.t("q_low"), Strings.t("q_off")}, "3");
+        toggle("low_effects", Strings.t("loweff_t"), Strings.t("loweff_n") + " " + Strings.t("changes_next"), "1", "0",
+                "0");
 
         section(Strings.t("sec_gpu"));
         note(Strings.t("gpu_n"));
@@ -605,8 +616,8 @@ public final class SettingsMenu {
 
     // ---- render scale -------------------------------------------------------------------------------------------
 
-    private static final float SCALE_MIN = 0.5f, SCALE_STEP = 0.05f;
-    private static final int SCALE_STEPS = 10;  // 0.5 .. 1.0
+    private static final float SCALE_MIN = 0.30f, SCALE_STEP = 0.05f;
+    private static final int SCALE_STEPS = 14;  // 0.30 .. 1.0
 
     /** The screen's long side / short side (what "Fill screen" uses). */
     private float screenAspect() {
@@ -631,9 +642,9 @@ public final class SettingsMenu {
             } catch (NumberFormatException ignored) {
             }
         }
-        float s = Math.max(0.5f, Math.min(1.0f, scale));
-        int h = Math.max(360, Math.min(720, Math.round(720f * s / 8f) * 8));
-        int w = Math.max(320, Math.min(1920, Math.round(h * aspect / 8f) * 8));
+        float s = Math.max(0.30f, Math.min(1.0f, scale));
+        int h = Math.max(216, Math.min(720, Math.round(720f * s / 8f) * 8));
+        int w = Math.max(216, Math.min(1920, Math.round(h * aspect / 8f) * 8));
         if (Math.abs(aspect - 16f / 9f) < 0.01f && h == 720) w = 1280;
         return new int[] {w, h};
     }

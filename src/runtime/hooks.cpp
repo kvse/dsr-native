@@ -102,26 +102,43 @@ const LogoSkip kLogoSkips[] = {
 };
 constexpr uint32_t kNop = 0xD503201F, kLdrS1Timer = 0xBD40E261;
 
-// Performance mode: low-quality effects, 1024x1024 shadow maps (see GameBuild); the menu also sets render scale 0.75.
+// Quality patches: low-quality effects (performance_mode or low_effects) and the shadow map size (shadow_quality;
+// performance_mode alone gives 1024). The menu also sets render scale 0.75 with performance mode.
 // Each part is checked before it is changed and is skipped (logged) if the game's code or data is not as expected.
-void ApplyPerformanceMode(Runtime& rt, const GameBuild& b) {
+void ApplyQualityPatches(Runtime& rt, const GameBuild& b) {
     constexpr uint32_t kLdrbLowVfx = 0x3956668A;    // ldrb w10, [x20, #0x599]
     constexpr uint32_t kMovLowVfxOn = 0x5280002A;   // mov w10, #1
     std::string err;
     std::string done;
-    if (rt.main.PatchInstruction(b.lowvfx_read, kLdrbLowVfx, kMovLowVfxOn, &err))
-        done += done.empty() ? "low-quality effects" : ", low-quality effects";
-    else
-        LOGW("hooks", "performance mode: effects quality not changed (%s)", err.c_str());
-    int32_t* shadow = reinterpret_cast<int32_t*>(rt.main.base() + b.shadow_size);
-    if (rt.main.Contains(reinterpret_cast<uintptr_t>(shadow)) && *shadow == 2048) {
-        *shadow = 1024;
-        done += done.empty() ? "shadow maps 1024" : ", shadow maps 1024";
-    } else {
-        LOGW("hooks", "performance mode: shadow map size not changed (found %d)",
-             rt.main.Contains(reinterpret_cast<uintptr_t>(shadow)) ? *shadow : -1);
+    auto add = [&](const char* what) {
+        if (!done.empty()) done += ", ";
+        done += what;
+    };
+    if (rt.config.performance_mode || rt.config.low_effects) {
+        if (rt.main.PatchInstruction(b.lowvfx_read, kLdrbLowVfx, kMovLowVfxOn, &err))
+            add("low-quality effects");
+        else
+            LOGW("hooks", "quality: effects quality not changed (%s)", err.c_str());
     }
-    LOGI("hooks", "performance mode: %s", done.empty() ? "nothing applied" : done.c_str());
+    int size = 2048;
+    switch (rt.config.shadow_quality) {
+        case 0: size = 512; break;   // off: the pass is skipped by the renderer; a 512 map is all that is left
+        case 1: size = 512; break;
+        case 2: size = 1024; break;
+        default: size = rt.config.performance_mode ? 1024 : 2048; break;
+    }
+    if (size != 2048) {
+        int32_t* shadow = reinterpret_cast<int32_t*>(rt.main.base() + b.shadow_size);
+        if (rt.main.Contains(reinterpret_cast<uintptr_t>(shadow)) && *shadow == 2048) {
+            *shadow = size;
+            add(size == 512 ? "shadow maps 512" : "shadow maps 1024");
+        } else {
+            LOGW("hooks", "quality: shadow map size not changed (found %d)",
+                 rt.main.Contains(reinterpret_cast<uintptr_t>(shadow)) ? *shadow : -1);
+        }
+    }
+    if (rt.config.shadow_quality == 0) add("shadows off");
+    LOGI("hooks", "quality: %s", done.empty() ? "nothing changed" : done.c_str());
 }
 
 void SkipIntroLogos(Runtime& rt, const GameBuild& b) {
@@ -475,7 +492,7 @@ void InstallGameHooks() {
     // game's half- and quarter-size buffers (640x360, 320x180) keep their 720-line sizes whatever the render
     // resolution, and a 4:3 test at 1280x960 died silently on loading a save. Only the width changes: wider
     // than 16:9 shows more at the sides, narrower (4:3: 960x720) less.
-    // Render scale (settings render_scale, 0.5 - 1.0): the same resolution settings at a lower size, height and
+    // Render scale (settings render_scale, 0.30 - 1.0): the same resolution settings at a lower size, height and
     // width together (the height also has a getter with its own default, main+0x6a193c: main+0x6a1968 mov w2, #720).
     // The game draws less and the frame is enlarged to the screen at the end. Heights stay at or below 720 (the
     // fixed half- and quarter-size buffers are then larger than needed, which is harmless).
@@ -495,9 +512,9 @@ void InstallGameHooks() {
             ar = 16.0f / 9.0f;
             ar_ok = false;
         }
-        const float scale = std::clamp(rt.config.render_scale, 0.5f, 1.0f);
-        const int height = std::clamp(int(std::lround(720.0f * scale / 8.0f)) * 8, 360, 720);
-        const int width = std::clamp(int(std::lround(float(height) * ar / 8.0f)) * 8, 320, 1920);
+        const float scale = std::clamp(rt.config.render_scale, 0.30f, 1.0f);
+        const int height = std::clamp(int(std::lround(720.0f * scale / 8.0f)) * 8, 216, 720);
+        const int width = std::clamp(int(std::lround(float(height) * ar / 8.0f)) * 8, 216, 1920);
         if (width != 1280 || height != 720) {
             std::string err;
             auto mov = [](int rd, int v) { return 0x52800000u | (uint32_t(v) << 5) | uint32_t(rd); };
@@ -523,7 +540,7 @@ void InstallGameHooks() {
         }
     }
     if (rt.config.skip_intro) SkipIntroLogos(rt, b);
-    if (rt.config.performance_mode) ApplyPerformanceMode(rt, b);
+    if (rt.config.performance_mode || rt.config.low_effects || rt.config.shadow_quality != 3) ApplyQualityPatches(rt, b);
     const Hook hooks[] = {
         {b.log, reinterpret_cast<void*>(&EngineLog), "engine log"},
         {b.vlog, reinterpret_cast<void*>(&EngineLogV), "engine vlog"},

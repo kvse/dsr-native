@@ -24,7 +24,10 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <chrono>
+#include <cstdio>
 #include <cstring>
+#include <type_traits>
 #include <memory>
 #include <thread>
 #include <deque>
@@ -48,6 +51,10 @@
 #include "hle/nvn/bc_decode.h"
 #include "hle/nvn/etc_encode.h"
 #include "hle/nvn/parallel.h"
+#include <condition_variable>
+#include <deque>
+#include <mutex>
+#include <thread>
 #include "runtime/runtime.h"
 #include "hle/nvn/layout.h"
 #include "hle/os/os.h"
@@ -457,6 +464,8 @@ struct Image {
     VkFormatFeatureFlags features = 0;
     bool written = false;  // has the GPU (or an upload) put anything in it
     bool uploaded = false;
+    bool pending = false;  // converted on the background thread; its copy is recorded when the result is ready
+    uint64_t serial = 0;   // identifies one upload (a result for a replaced image is dropped)
     // Contents came from game memory (not rendered by the GPU): re-uploaded when the game rewrites the
     // memory. Checked via a sparse hash: after an unchanged check the next one comes twice as many command
     // lists later (up to kMaxCheckInterval); a change, or an explicit MarkTextureDirty, resets that.
@@ -532,6 +541,9 @@ struct DrawState {
 };
 
 class VulkanBackend final : public Backend {
+public:
+    ~VulkanBackend() { StopBcThread(); }
+private:
 public:
     const char* Name() const override { return "vulkan"; }
 
@@ -1252,24 +1264,55 @@ public:
             SetWindowFrameRate();
         Image* src = tex.valid ? FindImage(tex) : nullptr;
         if (src && !(src->written && !IsDepthFormat(src->nvn_format))) src = nullptr;
-        // The swapchain is sized for the game's frame (see EnsureSwapchain): a frame of another size remakes it.
-        if (src && dsr::GetRuntime().config.compositor_scaling && (src->width != frame_w_ || src->height != frame_h_)) {
-            frame_w_ = src->width;
-            frame_h_ = src->height;
-            if (swapchain_) swapchain_dirty_ = true;
+        if (src) {
+            presented_addrs_.insert(src->addr);  // the textures the game presents: hud_full_res only redirects draws to them
+            HudUpdateSize(*src);
+        }
+        // The swapchain is sized for the game's frame (see EnsureSwapchain): a frame of another size remakes it. With
+        // hud_full_res it is sized for the screen-sized HUD image instead (the picture then needs no stretching).
+        if (src && (hud_w_ > 0 || dsr::GetRuntime().config.compositor_scaling)) {
+            const int tw = hud_w_ > 0 ? hud_w_ : src->width, th = hud_w_ > 0 ? hud_h_ : src->height;
+            if (tw != frame_w_ || th != frame_h_) {
+                frame_w_ = tw;
+                frame_h_ = th;
+                if (swapchain_) swapchain_dirty_ = true;
+            }
         }
         if (!EnsureSwapchain()) return;
         // Acquire, copy and present run on the recorder after this frame's commands; the render thread goes on.
         BeginCommands();
+        EnsureOverlay();
+        WarmupStep(25.0);
+        PumpBcUploads();
         PresentJob pj;
+        // hud_full_res: this frame's HUD went into hud_img_ (the enlarged 3D picture plus the HUD): show that one.
+        Image* shown = src;
         if (src) {
-            Transition(*src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-            pj.src = src->image;
-            pj.sw = src->width;
-            pj.sh = src->height;
+            if (hud_final_ && hud2_img_.image) {
+                shown = &hud2_img_;  // the final pass ran on the enlarged picture, at the screen's size
+            } else if (hud_started_ && hud_img_.image && src->addr == hud_t_addr_) {
+                shown = &hud_img_;   // the HUD frame is presented as it is
+            } else if (hud_started_ && ++hud_orphans_ >= 3) {
+                // The HUD went into the enlarged picture but nothing turned it into the presented frame: stop using it.
+                hud_sources_.erase(hud_t_addr_);
+                hud_orphans_ = 0;
+                LOGW(kTag, "hud_full_res: the HUD frame @%llx never reached the screen: not redirected any more",
+                     (unsigned long long)hud_t_addr_);
+            }
+            if (shown != src) hud_orphans_ = 0;
+        }
+        hud_started_ = false;
+        hud_final_ = false;
+        hud_cand_addr_ = 0;
+        if (shown) {
+            if (shown == &hud_img_ || shown == &hud2_img_) EndRendering();
+            Transition(*shown, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+            pj.src = shown->image;
+            pj.sw = shown->width;
+            pj.sh = shown->height;
             if (!logged_first_image_) {
                 logged_first_image_ = true;
-                LOGI(kTag, "showing the game's frame: %dx%d (format %d)", pj.sw, pj.sh, src->nvn_format);
+                LOGI(kTag, "showing the game's frame: %dx%d (format %d)", pj.sw, pj.sh, shown->nvn_format);
             }
         }
         barriers_ += 2;
@@ -1304,6 +1347,116 @@ private:
                              nullptr, 1, &b);
     }
     // Recorder: acquires a swapchain image, copies the frame into it, submits slot i and presents.
+    // ---- progress overlay, drawn by the presenter -------------------------------------------------------------
+    // Two 1x1 images, white (0) and black (1), are blitted as rectangles; a glyph pixel is one rectangle.
+    VkImage ov_img_[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+    VkDeviceMemory ov_mem_[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+    bool ov_ready_ = false, ov_failed_ = false;
+
+    void EnsureOverlay() {
+        if (ov_ready_ || ov_failed_) return;
+        for (int i = 0; i < 2; i++) {
+            VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+            ci.imageType = VK_IMAGE_TYPE_2D;
+            ci.format = VK_FORMAT_R8G8B8A8_UNORM;
+            ci.extent = {1, 1, 1};
+            ci.mipLevels = 1;
+            ci.arrayLayers = 1;
+            ci.samples = VK_SAMPLE_COUNT_1_BIT;
+            ci.tiling = VK_IMAGE_TILING_OPTIMAL;
+            ci.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+            ci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+            ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            if (vkCreateImage(device_, &ci, nullptr, &ov_img_[i]) != VK_SUCCESS) {
+                ov_failed_ = true;
+                return;
+            }
+            VkMemoryRequirements req;
+            vkGetImageMemoryRequirements(device_, ov_img_[i], &req);
+            VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+            ai.allocationSize = req.size;
+            ai.memoryTypeIndex = FindMemory(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            if (vkAllocateMemory(device_, &ai, nullptr, &ov_mem_[i]) != VK_SUCCESS) {
+                ov_failed_ = true;
+                return;
+            }
+            vkBindImageMemory(device_, ov_img_[i], ov_mem_[i], 0);
+            VkClearColorValue colour{};
+            colour.float32[0] = colour.float32[1] = colour.float32[2] = i == 0 ? 1.0f : 0.0f;
+            colour.float32[3] = 1.0f;
+            const VkImage img = ov_img_[i];
+            Rec([img, colour](VkCommandBuffer cb) {
+                const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+                VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+                b.image = img;
+                b.subresourceRange = range;
+                b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+                b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+                b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr,
+                                     0, nullptr, 1, &b);
+                vkCmdClearColorImage(cb, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &colour, 1, &range);
+                b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                b.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+                b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+                b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+                vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr,
+                                     0, nullptr, 1, &b);
+            });
+        }
+        ov_ready_ = true;
+        LOGI(kTag, "progress overlay ready");
+    }
+
+    void OverlayRect(VkCommandBuffer cb, VkImage sc, int which, int x, int y, int w, int h) {
+        const int dw = int(sc_extent_.width), dh = int(sc_extent_.height);
+        if (w <= 0 || h <= 0 || x < 0 || y < 0 || x + w > dw || y + h > dh) return;
+        VkImageBlit b{};
+        b.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        b.srcOffsets[1] = {1, 1, 1};
+        b.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        b.dstOffsets[0] = {x, y, 0};
+        b.dstOffsets[1] = {x + w, y + h, 1};
+        vkCmdBlitImage(cb, ov_img_[which], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, sc, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                       1, &b, VK_FILTER_NEAREST);
+    }
+
+    // 3x5 pixel glyphs: '#' is a lit pixel.
+    static const char* const* GlyphRows(char c) {
+        static const char* const kDigits[10][5] = {
+            {"###", "#.#", "#.#", "#.#", "###"}, {".#.", "##.", ".#.", ".#.", "###"},
+            {"###", "..#", "###", "#..", "###"}, {"###", "..#", "###", "..#", "###"},
+            {"#.#", "#.#", "###", "..#", "..#"}, {"###", "#..", "###", "..#", "###"},
+            {"###", "#..", "###", "#.#", "###"}, {"###", "..#", "..#", "..#", "..#"},
+            {"###", "#.#", "###", "#.#", "###"}, {"###", "#.#", "###", "..#", "###"}};
+        static const char* const kPct[5] = {"#.#", "..#", ".#.", "#..", "#.#"};
+        static const char* const kSpace[5] = {"...", "...", "...", "...", "..."};
+        if (c >= '0' && c <= '9') return kDigits[c - '0'];
+        if (c == '%') return kPct;
+        return kSpace;
+    }
+    void DrawGlyphText(VkCommandBuffer cb, VkImage sc, const std::string& text, int x0, int y0, int px) {
+        const int adv = 4;  // 3 columns and a gap
+        for (size_t ci = 0; ci < text.size(); ci++) {
+            const char* const* rows = GlyphRows(text[ci]);
+            for (int r = 0; r < 5; r++)
+                for (int col = 0; col < 3; col++)
+                    if (rows[r][col] == '#')
+                        OverlayRect(cb, sc, 0, x0 + int(ci) * adv * px + col * px, y0 + r * px, px, px);
+        }
+    }
+    void DrawProgressBar(VkCommandBuffer cb, VkImage sc, int permille) {
+        const int dw = int(sc_extent_.width), dh = int(sc_extent_.height);
+        const int px = std::max(3, dh / 120), bw = dw * 2 / 5, bh = px * 3;
+        const int x0 = (dw - bw) / 2, y0 = dh - bh * 4;
+        const int pct = std::min(permille, 1000) / 10;
+        DrawGlyphText(cb, sc, std::to_string(pct) + "%", x0, y0 - px * 8, px);
+        OverlayRect(cb, sc, 1, x0 - px, y0 - px, bw + 2 * px, bh + 2 * px);  // black frame
+        OverlayRect(cb, sc, 0, x0, y0, bw * std::min(permille, 1000) / 1000, bh);  // white fill
+    }
+
     void PresentSlot(int i, const PresentJob& pj) {
         uint32_t idx = 0;
         VkResult r = vkAcquireNextImageKHR(device_, swapchain_, 1000000000ull, acquire_sem_, VK_NULL_HANDLE, &idx);
@@ -1344,8 +1497,13 @@ private:
             blit.dstOffsets[0] = {x, y, 0};
             blit.dstOffsets[1] = {x + w, y + h, 1};
             vkCmdBlitImage(cmd_, pj.src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, sc, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
-                           &blit, w == pj.sw && h == pj.sh ? VK_FILTER_NEAREST : VK_FILTER_LINEAR);
+                           &blit,
+                           w == pj.sw && h == pj.sh || dsr::GetRuntime().config.scale_filter == 0
+                               ? VK_FILTER_NEAREST
+                               : VK_FILTER_LINEAR);
         }
+        const int warm = warm_permille_.load();
+        if (ov_ready_ && warm >= 0) DrawProgressBar(cmd_, sc, warm);
         CmdImageBarrier(cmd_, sc, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
         SubmitSlot(i, acquire_sem_, render_sem_);
         VkPresentInfoKHR pi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
@@ -1562,6 +1720,8 @@ private:
         vkCreateSemaphore(device_, &sci, nullptr, &acquire_sem_);
         vkCreateSemaphore(device_, &sci, nullptr, &render_sem_);
         LoadPipelineCache();
+        LoadShaderCache();
+        WarmupShaders();
         init_failed_ = false;
         LOGI(kTag, "device ready (queue family %u)", family_);
         return true;
@@ -1860,6 +2020,8 @@ private:
         // display hardware, as a rule) instead of the GPU clearing and filling a screen-sized image every frame
         // (2340x1080 from 1560x720 on the OnePlus 6T: twice the pixels of the game's own frame).
         const VkExtent2D window_extent = extent;
+        win_w_ = int(window_extent.width);  // hud_full_res sizes its image from this (see HudUpdateSize)
+        win_h_ = int(window_extent.height);
         if (dsr::GetRuntime().config.compositor_scaling && frame_w_ > 0 && frame_h_ > 0 && extent.width && extent.height) {
             const double k = std::max(double(frame_w_) / extent.width, double(frame_h_) / extent.height);
             if (k < 0.999) {
@@ -2061,6 +2223,7 @@ private:
         Image* img = FindImage(t);
         if (!img) img = CreateImage(t);
         if (!img) return nullptr;
+        if (img->pending && !img->written) return nullptr;  // converting in the background: not drawn yet
         if (upload && TakeFrame(*img, t)) return img;
         if (upload && !img->written && !img->uploaded) {
             Upload(*img, t);
@@ -2384,21 +2547,82 @@ private:
     double bc_convert_ms_ = 0;     // conversion time, for the stats line
     uint64_t bc_cache_hits_ = 0, bc_converted_levels_ = 0;
 
-    void RunBcJobs() {
-        if (bc_jobs_.empty()) return;
-        const auto t0 = std::chrono::steady_clock::now();
-        bc_tasks_.clear();
-        for (uint32_t j = 0; j < bc_jobs_.size(); j++) {
-            const BcJob& job = bc_jobs_[j];
+    // ---- BC textures: converted on a background thread --------------------------------------------------
+    // Converting a large texture takes seconds on a phone; done on the render thread it stalled the game. Now one
+    // background thread converts it (WorkPool helps), and the render thread records the copy a few frames later
+    // (PumpBcUploads), at most kBcFrameBudget bytes per frame. Until the copy is recorded the texture is not drawn.
+    static constexpr size_t kBcFrameBudget = size_t(24) << 20;
+    static constexpr size_t kBcSyncBytes = size_t(2) << 20;  // converted textures up to this size are not queued
+
+    struct PendingLevel {
+        size_t src_off = 0, n = 0, out_off = 0, out_bytes = 0;
+        LevelLayout lay;
+        bool linear = false;
+        int bx = 0, brows = 0, w = 1, h = 1, depth = 1;
+    };
+    struct PendingBc {
+        uint64_t addr = 0, serial = 0;
+        int nvn_format = 0;
+        BcKind kind = BcKind::None;
+        BcTo to = BcTo::Decoded;
+        bool punch = false;
+        std::vector<uint8_t> raw;                // a copy of the texture's guest memory (the game may rewrite it)
+        std::vector<PendingLevel> levels;
+        std::vector<VkBufferImageCopy> regions;  // bufferOffset relative to `result`
+        size_t result_bytes = 0;
+        std::vector<uint8_t> result;             // converted levels, back to back (filled by the background thread)
+        uint64_t cache_hits = 0;
+        std::atomic<bool> done{false};
+    };
+    std::deque<std::shared_ptr<PendingBc>> bc_queue_;     // to the background thread (under bc_mutex_)
+    std::deque<std::shared_ptr<PendingBc>> bc_inflight_;  // render thread: queued order, recorded when done
+    std::mutex bc_mutex_, etc_mutex_;
+    std::condition_variable bc_cv_;
+    bool bc_stop_ = false;
+    std::thread bc_thread_;
+    uint64_t image_serial_ = 0, bc_queued_ = 0;
+
+    void EnsureBcThread() {
+        if (!bc_thread_.joinable()) bc_thread_ = std::thread([this] { BcThreadLoop(); });
+    }
+    void StopBcThread() {
+        {
+            std::lock_guard<std::mutex> lk(bc_mutex_);
+            bc_stop_ = true;
+        }
+        bc_cv_.notify_all();
+        if (bc_thread_.joinable()) bc_thread_.join();
+    }
+    void BcThreadLoop() {
+        for (;;) {
+            std::shared_ptr<PendingBc> p;
+            {
+                std::unique_lock<std::mutex> lk(bc_mutex_);
+                bc_cv_.wait(lk, [this] { return bc_stop_ || !bc_queue_.empty(); });
+                if (bc_queue_.empty()) return;  // stop requested and nothing left to convert
+                p = bc_queue_.front();
+                bc_queue_.pop_front();
+            }
+            ConvertPending(*p);
+            p->done.store(true, std::memory_order_release);
+        }
+    }
+
+    // Converts the BC jobs (BC -> RGBA8 or ETC2) with WorkPool; the tasks of each job write its own output.
+    void ConvertJobs(const std::vector<BcJob>& jobs) {
+        if (jobs.empty()) return;
+        std::vector<BcTask> tasks;
+        for (uint32_t j = 0; j < jobs.size(); j++) {
+            const BcJob& job = jobs[j];
             const int band = std::max(2, 4096 / std::max(1, job.bx));  // ~4096 blocks per task
             for (int z = 0; z < job.depth; z++)
                 for (int r = 0; r < job.brows && r * 4 < job.h; r += band)
-                    bc_tasks_.push_back({j, z, r, std::min(band, job.brows - r)});
+                    tasks.push_back({j, z, r, std::min(band, job.brows - r)});
         }
-        WorkPool::Get().Run(bc_tasks_.size(), [this](size_t i) {
+        WorkPool::Get().Run(tasks.size(), [&](size_t i) {
             thread_local std::vector<uint8_t> rgba;
-            const BcTask& k = bc_tasks_[i];
-            const BcJob& j = bc_jobs_[k.job];
+            const BcTask& k = tasks[i];
+            const BcJob& j = jobs[k.job];
             const int bpb = (j.kind == BcKind::BC1 || j.kind == BcKind::BC4U || j.kind == BcKind::BC4S) ? 8 : 16;
             const uint8_t* blocks = j.blocks + (size_t(k.z) * size_t(j.brows) + size_t(k.row0)) * size_t(j.bx) * bpb;
             const int y0 = k.row0 * 4, hh = std::min(j.h - y0, k.rows * 4);
@@ -2421,28 +2645,179 @@ private:
                     break;
             }
         });
-        for (const BcJob& j : bc_jobs_) {
-            bc_converted_levels_++;
-            if (!j.key) continue;
-            if (etc_cache_bytes_ + j.out_bytes > kEtcCacheLimit) {
-                etc_cache_.clear();
-                etc_cache_bytes_ = 0;
+    }
+
+    // Background thread: deswizzles every level, takes what the ETC2 cache has, converts the rest.
+    void ConvertPending(PendingBc& p) {
+        p.result.assign(p.result_bytes, 0);
+        size_t blocks_total = 0;
+        for (const PendingLevel& L : p.levels) blocks_total += L.n;
+        std::vector<uint8_t> blocks(blocks_total);
+        std::vector<BcJob> jobs;
+        std::vector<uint64_t> keys;  // parallel to jobs: the ETC2 cache key (0: not cached)
+        size_t off = 0;
+        for (const PendingLevel& L : p.levels) {
+            uint8_t* dst = blocks.data() + off;
+            off += L.n;
+            if (L.linear)
+                memcpy(dst, p.raw.data() + L.src_off, L.n);
+            else
+                DeswizzleLevel(dst, p.raw.data() + L.src_off, L.lay);
+            uint8_t* out = p.result.data() + L.out_off;
+            uint64_t key = 0;
+            if (p.to != BcTo::Decoded) {
+                key = HashStep(Fnv(dst, L.n), uint64_t(p.nvn_format) << 48 ^ uint64_t(L.w) << 24 ^ uint64_t(L.h) ^
+                                                  uint64_t(L.depth) << 40) | 1;
+                std::lock_guard<std::mutex> lk(etc_mutex_);
+                auto hit = etc_cache_.find(key);
+                if (hit != etc_cache_.end() && hit->second.size() == L.out_bytes) {
+                    memcpy(out, hit->second.data(), L.out_bytes);
+                    p.cache_hits++;
+                    continue;
+                }
             }
-            auto& e = etc_cache_[j.key];
-            etc_cache_bytes_ += j.out_bytes - e.size();
-            e.assign(j.out, j.out + j.out_bytes);
+            jobs.push_back(BcJob{p.kind, p.to, p.punch, dst, L.bx, L.brows, L.w, L.h, L.depth, out, L.out_bytes, key});
+            keys.push_back(key);
         }
-        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-        bc_convert_ms_ += ms;
-        static int logged = 0;
-        if (ms > 30 && logged++ < 20)
-            LOGI(kTag, "texture conversion: %zu levels in %zu tasks, %.1f ms (%d workers + render thread)",
-                 bc_jobs_.size(), bc_tasks_.size(), ms, WorkPool::Get().Workers());
-        bc_jobs_.clear();
+        p.raw.clear();
+        p.raw.shrink_to_fit();  // the copy of the game memory is no longer needed
+        ConvertJobs(jobs);
+        if (p.to != BcTo::Decoded) {
+            std::lock_guard<std::mutex> lk(etc_mutex_);
+            for (size_t i = 0; i < jobs.size(); i++) {
+                if (!keys[i]) continue;
+                const BcJob& j = jobs[i];
+                if (etc_cache_bytes_ + j.out_bytes > kEtcCacheLimit) {
+                    etc_cache_.clear();
+                    etc_cache_bytes_ = 0;
+                }
+                auto& e = etc_cache_[j.key];
+                etc_cache_bytes_ += j.out_bytes - e.size();
+                e.assign(j.out, j.out + j.out_bytes);
+            }
+        }
+    }
+
+    // Render thread: queues a BC texture for the background thread. The image is not drawn until PumpBcUploads
+    // has recorded its copy (a re-upload keeps the old contents meanwhile).
+    void EnqueueBcUpload(Image& img, const TexRef& t, const TextureLayout& layout, const FormatInfo& fi) {
+        auto p = std::make_shared<PendingBc>();
+        p->addr = t.addr;
+        p->serial = img.serial = ++image_serial_;
+        p->nvn_format = img.nvn_format;
+        p->kind = img.bc;
+        p->to = img.bc_to;
+        p->punch = EtcHasPunchThrough(img.nvn_format);
+        const uint8_t* base = reinterpret_cast<const uint8_t*>(t.addr);
+        p->raw.assign(base, base + layout.total);
+        size_t out = 0;
+        for (int layer = 0; layer < img.layers; layer++)
+            for (int lv = 0; lv < img.levels; lv++) {
+                const LevelLayout& l = layout.levels[size_t(lv + img.mip_skip)];
+                PendingLevel L;
+                L.src_off = size_t(layer) * layout.layer_stride + l.offset;
+                L.n = size_t(l.row_bytes) * l.rows * l.depth;
+                L.lay = l;
+                L.linear = layout.linear;
+                L.w = std::max(1, l.width);
+                L.h = std::max(1, l.height);
+                L.depth = l.depth;
+                L.bx = l.row_bytes / std::max(1, fi.bytes_per_block);
+                L.brows = l.rows;
+                L.out_bytes = ConvertedLevelBytes(img, L.w, L.h, L.depth);
+                out = (out + 15) & ~size_t(15);
+                L.out_off = out;
+                out += L.out_bytes;
+                VkBufferImageCopy r{};
+                r.bufferOffset = L.out_off;
+                r.imageSubresource = {img.aspect & ~VK_IMAGE_ASPECT_STENCIL_BIT ? img.aspect & ~VK_IMAGE_ASPECT_STENCIL_BIT
+                                                                                 : img.aspect,
+                                      uint32_t(lv), uint32_t(layer), 1};
+                r.imageExtent = {uint32_t(L.w), uint32_t(img.type == VK_IMAGE_TYPE_1D ? 1 : L.h), uint32_t(L.depth)};
+                p->regions.push_back(r);
+                p->levels.push_back(L);
+            }
+        p->result_bytes = out;
+        // Small conversions are done right here and recorded now: a texture that is queued is drawn with a white
+        // stand-in until its copy lands, and those few frames read as flicker. Only big ones go to the thread.
+        if (out <= kBcSyncBytes && StreamRemaining() >= out + 1024) {
+            ConvertPending(*p);
+            p->done.store(true, std::memory_order_release);
+            Begin();
+            EndRendering();
+            const VkDeviceSize off = StreamAlloc(out, 16);
+            memcpy(stream_ptr_ + off, p->result.data(), out);
+            std::vector<VkBufferImageCopy> regions = p->regions;
+            for (VkBufferImageCopy& r : regions) r.bufferOffset += off;
+            Transition(img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+            Rec([regions = std::move(regions), buf = stream_, image = img.image](VkCommandBuffer cb) {
+                vkCmdCopyBufferToImage(cb, buf, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, uint32_t(regions.size()),
+                                       regions.data());
+            });
+            img.written = true;
+            img.pending = false;
+            uploads_++;
+            bc_converted_levels_ += p->levels.size();
+            bc_cache_hits_ += p->cache_hits;
+            return;
+        }
+        img.pending = true;
+        EnsureBcThread();
+        {
+            std::lock_guard<std::mutex> lk(bc_mutex_);
+            bc_queue_.push_back(p);
+        }
+        bc_cv_.notify_one();
+        bc_inflight_.push_back(p);
+        if (++bc_queued_ <= 24)
+            LOGI(kTag, "texture %dx%d format %d: converting in the background (%zu bytes)", img.width, img.height,
+                 img.nvn_format, out);
+    }
+
+    // Render thread, once per frame: records the copies of converted textures, in the order they were queued,
+    // at most kBcFrameBudget bytes per frame. A result whose texture was replaced or released is dropped.
+    void PumpBcUploads() {
+        if (bc_inflight_.empty()) return;
+        size_t budget = kBcFrameBudget;
+        bool ended = false;
+        while (!bc_inflight_.empty() && bc_inflight_.front()->done.load(std::memory_order_acquire)) {
+            std::shared_ptr<PendingBc> p = bc_inflight_.front();
+            auto it = images_.find(p->addr);
+            if (it == images_.end() || !it->second.pending || it->second.serial != p->serial) {
+                bc_inflight_.pop_front();
+                continue;
+            }
+            const size_t bytes = p->result_bytes;
+            if (bytes > budget && budget < kBcFrameBudget) break;  // the rest waits for the next frame
+            if (StreamRemaining() < bytes + 1024) break;           // the stream is reset next frame
+            if (!ended) {
+                EndRendering();
+                ended = true;
+            }
+            Image& img = it->second;
+            const VkDeviceSize off = StreamAlloc(bytes, 16);
+            memcpy(stream_ptr_ + off, p->result.data(), bytes);
+            std::vector<VkBufferImageCopy> regions = p->regions;
+            for (VkBufferImageCopy& r : regions) r.bufferOffset += off;
+            Transition(img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+            Rec([regions = std::move(regions), buf = stream_, image = img.image](VkCommandBuffer cb) {
+                vkCmdCopyBufferToImage(cb, buf, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, uint32_t(regions.size()),
+                                       regions.data());
+            });
+            img.written = true;
+            img.pending = false;
+            uploads_++;
+            bc_converted_levels_ += p->levels.size();
+            bc_cache_hits_ += p->cache_hits;
+            budget = budget > bytes ? budget - bytes : 0;
+            std::vector<uint8_t>().swap(p->result);  // free the CPU copy of the converted texels
+            bc_inflight_.pop_front();
+        }
     }
 
     // Fills a sampled texture from game memory: deswizzle each level/layer into the stream, then copy.
     void Upload(Image& img, const TexRef& t) {
+        if (img.pending) return;  // already on its way (a re-upload while the first conversion runs)
         img.uploaded = true;
         img.cpu_source = true;
         img.sample_hash = SampleHash(t);
@@ -2468,66 +2843,31 @@ private:
             LogOnce("upload-size", "texture too large to upload in one go (%zu bytes)", needed);
             return;
         }
+        if (img.bc != BcKind::None) {
+            EnqueueBcUpload(img, t, layout, fi);
+            return;
+        }
         Begin();
         EndRendering();
         if (StreamRemaining() < needed + 1024) Flush();
         std::vector<VkBufferImageCopy> regions;
         const uint8_t* base = reinterpret_cast<const uint8_t*>(t.addr);
-        if (img.bc != BcKind::None) {  // room for every level's deswizzled blocks (converted after the loop)
-            size_t scratch = 0;
-            for (int layer = 0; layer < img.layers; layer++)
-                for (int lv = 0; lv < img.levels; lv++) {
-                    const LevelLayout& l = layout.levels[size_t(lv + img.mip_skip)];
-                    scratch += size_t(l.row_bytes) * l.rows * l.depth;
-                }
-            if (bc_scratch_.size() < scratch) bc_scratch_.resize(scratch);
-        }
         size_t scratch_used = 0;
+        (void)scratch_used;
         for (int layer = 0; layer < img.layers; layer++) {
             for (int lv = 0; lv < img.levels; lv++) {
                 const LevelLayout& l = layout.levels[size_t(lv + img.mip_skip)];
                 const size_t n = size_t(l.row_bytes) * l.rows * l.depth;
                 const uint8_t* src = base + size_t(layer) * layout.layer_stride + l.offset;
+                VkDeviceSize off = StreamAlloc(n, 16);
+                if (layout.linear)
+                    memcpy(stream_ptr_ + off, src, n);
+                else
+                    DeswizzleLevel(stream_ptr_ + off, src, l);
                 VkBufferImageCopy r{};
-                if (img.bc != BcKind::None) {
-                    // Deswizzle the blocks now; they are converted into the upload buffer after the loop (RunBcJobs),
-                    // in parallel, or copied from the ETC2 cache.
-                    uint8_t* blocks = bc_scratch_.data() + scratch_used;
-                    scratch_used += n;
-                    if (layout.linear)
-                        memcpy(blocks, src, n);
-                    else
-                        DeswizzleLevel(blocks, src, l);
-                    const int w = std::max(1, l.width), h = std::max(1, l.height);
-                    const size_t out_bytes = ConvertedLevelBytes(img, w, h, l.depth);
-                    VkDeviceSize off = StreamAlloc(out_bytes, 16);
-                    BcJob job{img.bc, img.bc_to, EtcHasPunchThrough(img.nvn_format), blocks,
-                              int(l.row_bytes / std::max(1, fi.bytes_per_block)), int(l.rows), w, h, l.depth,
-                              stream_ptr_ + off, out_bytes, 0};
-                    bool cached = false;
-                    if (img.bc_to != BcTo::Decoded) {
-                        job.key = HashStep(Fnv(blocks, n), uint64_t(img.nvn_format) << 48 ^ uint64_t(w) << 24 ^
-                                                               uint64_t(h) ^ uint64_t(l.depth) << 40) | 1;
-                        auto hit = etc_cache_.find(job.key);
-                        if (hit != etc_cache_.end() && hit->second.size() == out_bytes) {
-                            memcpy(job.out, hit->second.data(), out_bytes);
-                            bc_cache_hits_++;
-                            cached = true;
-                        }
-                    }
-                    if (!cached) bc_jobs_.push_back(job);
-                    r.bufferOffset = off;
-                    bc_decoded_bytes_ += n;
-                } else {
-                    VkDeviceSize off = StreamAlloc(n, 16);
-                    if (layout.linear)
-                        memcpy(stream_ptr_ + off, src, n);
-                    else
-                        DeswizzleLevel(stream_ptr_ + off, src, l);
-                    r.bufferOffset = off;
-                    r.bufferRowLength = uint32_t(l.row_bytes / fi.bytes_per_block * fi.block_w);
-                    r.bufferImageHeight = uint32_t(l.rows * fi.block_h);
-                }
+                r.bufferOffset = off;
+                r.bufferRowLength = uint32_t(l.row_bytes / fi.bytes_per_block * fi.block_w);
+                r.bufferImageHeight = uint32_t(l.rows * fi.block_h);
                 r.imageSubresource = {img.aspect & ~VK_IMAGE_ASPECT_STENCIL_BIT ? img.aspect & ~VK_IMAGE_ASPECT_STENCIL_BIT
                                                                                  : img.aspect,
                                       uint32_t(lv), uint32_t(layer), 1};
@@ -2536,7 +2876,6 @@ private:
                 regions.push_back(r);
             }
         }
-        RunBcJobs();  // the converted texels are in the stream before the copy is recorded
         Transition(img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
         Rec([regions = std::move(regions), buf = stream_, image = img.image](VkCommandBuffer cb) {
             vkCmdCopyBufferToImage(cb, buf, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, uint32_t(regions.size()),
@@ -2713,6 +3052,7 @@ private:
                 case 3: ci.compareOp = VK_COMPARE_OP_NEVER; break;
                 default: break;
             }
+            if (dsr::GetRuntime().config.shadow_quality == 0) ci.compareOp = VK_COMPARE_OP_NEVER;  // always lit
         }
         ci.borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
         VkSampler smp = VK_NULL_HANDLE;
@@ -3813,6 +4153,194 @@ private:
     // ======================================================================================================
     // shaders, layouts, pipelines
     // ======================================================================================================
+    // ---- persistent shader cache and warm-up ------------------------------------------------------------------
+    // Guest shaders are translated once. The translation (SPIR-V and shader info) is kept in
+    // cache/shader_cache.bin, keyed by the guest code's hash and the translation options, so it is the same on
+    // every run. Each translated shader's code and options are also kept in cache/shader_warm.bin; on the next
+    // start, WarmupShaders() translates the ones the disk cache lacks, before the game starts, so the game does not
+    // stop to translate them. Bump the versions when the translator's output or these layouts change.
+    static constexpr uint32_t kShaderCacheVersion = 1, kWarmVersion = 1;
+    struct CachedShader {
+        std::vector<uint32_t> spirv;
+        shader::ShaderInfo info;
+    };
+    std::unordered_map<std::vector<uint32_t>, CachedShader, VecHash> shader_disk_;
+    std::unordered_map<std::vector<uint32_t>, int, VecHash> warm_seen_;
+    bool shader_cache_writable_ = false;
+    uint64_t shader_cache_hits_ = 0, shader_cache_misses_ = 0;
+    struct WarmRec {
+        std::vector<uint32_t> key;
+        shader::TranslateOptions opt;
+        std::vector<uint8_t> code;
+    };
+
+    std::string CacheFile(const char* name) const {
+        const std::string& dir = dsr::GetRuntime().config.cache_dir;
+        return dir.empty() ? std::string() : dir + "/" + name;
+    }
+    static void WriteShaderRecord(FILE* f, const std::vector<uint32_t>& key, const std::vector<uint32_t>& spirv,
+                                  const shader::ShaderInfo& info) {
+        const uint32_t nwords = uint32_t(spirv.size()), info_size = uint32_t(sizeof(info));
+        fwrite(key.data(), 4, key.size(), f);
+        fwrite(&nwords, 4, 1, f);
+        fwrite(&info_size, 4, 1, f);
+        fwrite(&info, sizeof(info), 1, f);
+        fwrite(spirv.data(), 4, spirv.size(), f);
+    }
+    void RewriteShaderCache(const std::string& path) {
+        FILE* f = fopen(path.c_str(), "wb");
+        if (!f) {
+            shader_cache_writable_ = false;
+            return;
+        }
+        const char magic[8] = {'D', 'S', 'R', 'S', 'C', '0', '1', 0};
+        fwrite(magic, 1, 8, f);
+        fwrite(&kShaderCacheVersion, 4, 1, f);
+        for (const auto& e : shader_disk_) WriteShaderRecord(f, e.first, e.second.spirv, e.second.info);
+        fclose(f);
+        shader_cache_writable_ = true;
+    }
+    void LoadShaderCache() {
+        static_assert(std::is_trivially_copyable<shader::ShaderInfo>::value, "ShaderInfo must be plain data");
+        const std::string path = CacheFile("shader_cache.bin");
+        if (path.empty()) return;
+        const char magic[8] = {'D', 'S', 'R', 'S', 'C', '0', '1', 0};
+        bool damaged = true;
+        if (FILE* f = fopen(path.c_str(), "rb")) {
+            char m[8];
+            uint32_t ver = 0;
+            if (fread(m, 1, 8, f) == 8 && memcmp(m, magic, 8) == 0 && fread(&ver, 4, 1, f) == 1 &&
+                ver == kShaderCacheVersion) {
+                damaged = false;
+                for (;;) {
+                    uint32_t key[6], nwords = 0, info_size = 0;
+                    if (fread(key, 4, 6, f) != 6) break;  // clean end of file
+                    if (fread(&nwords, 4, 1, f) != 1 || fread(&info_size, 4, 1, f) != 1) {
+                        damaged = true;
+                        break;
+                    }
+                    CachedShader c;
+                    if (info_size != sizeof(c.info) || nwords == 0 || nwords > (1u << 22)) {
+                        damaged = true;
+                        break;
+                    }
+                    c.spirv.resize(nwords);
+                    if (fread(&c.info, sizeof(c.info), 1, f) != 1 || fread(c.spirv.data(), 4, nwords, f) != nwords) {
+                        damaged = true;
+                        break;
+                    }
+                    shader_disk_.emplace(std::vector<uint32_t>(key, key + 6), std::move(c));
+                }
+            }
+            fclose(f);
+        }
+        if (damaged) {
+            shader_disk_.clear();  // missing, another version or damaged: start a fresh file
+            RewriteShaderCache(path);
+        } else {
+            shader_cache_writable_ = true;
+        }
+        LOGI(kTag, "shader cache: %zu translated shaders loaded", shader_disk_.size());
+    }
+    void AppendShaderCache(const std::vector<uint32_t>& key, const shader::TranslateResult& r) {
+        if (!shader_cache_writable_) return;
+        if (FILE* f = fopen(CacheFile("shader_cache.bin").c_str(), "ab")) {
+            WriteShaderRecord(f, key, r.spirv, r.info);
+            fclose(f);
+        }
+    }
+    // Shaders translated in this run: their code and options, for the warm-up of the next start.
+    void RememberForWarmup(const ShaderCode& code, const shader::TranslateOptions& opt, const std::vector<uint32_t>& key) {
+        static_assert(std::is_trivially_copyable<shader::TranslateOptions>::value, "options are stored as bytes");
+        if (!warm_seen_.emplace(key, 1).second) return;
+        const std::string path = CacheFile("shader_warm.bin");
+        FILE* f = path.empty() ? nullptr : fopen(path.c_str(), "ab");
+        if (!f) return;
+        if (ftell(f) == 0) {
+            const char magic[8] = {'D', 'S', 'R', 'W', 'U', '0', '1', 0};
+            fwrite(magic, 1, 8, f);
+            fwrite(&kWarmVersion, 4, 1, f);
+        }
+        const uint32_t opt_size = uint32_t(sizeof(opt)), code_size = uint32_t(code.code.size());
+        fwrite(key.data(), 4, key.size(), f);
+        fwrite(&opt_size, 4, 1, f);
+        fwrite(&code_size, 4, 1, f);
+        fwrite(&opt, sizeof(opt), 1, f);
+        fwrite(code.code.data(), 1, code.code.size(), f);
+        fclose(f);
+    }
+    std::vector<WarmRec> ReadWarm() {
+        std::vector<WarmRec> out;
+        const std::string path = CacheFile("shader_warm.bin");
+        FILE* f = path.empty() ? nullptr : fopen(path.c_str(), "rb");
+        if (!f) return out;
+        const char magic[8] = {'D', 'S', 'R', 'W', 'U', '0', '1', 0};
+        char m[8];
+        uint32_t ver = 0;
+        if (fread(m, 1, 8, f) == 8 && memcmp(m, magic, 8) == 0 && fread(&ver, 4, 1, f) == 1 && ver == kWarmVersion) {
+            for (;;) {
+                uint32_t k[6], opt_size = 0, code_size = 0;
+                if (fread(k, 4, 6, f) != 6) break;
+                if (fread(&opt_size, 4, 1, f) != 1 || fread(&code_size, 4, 1, f) != 1) break;
+                WarmRec w;
+                w.key.assign(k, k + 6);
+                if (opt_size != sizeof(w.opt) || code_size == 0 || code_size > (1u << 24)) break;  // another version
+                if (fread(&w.opt, sizeof(w.opt), 1, f) != 1) break;
+                w.code.resize(code_size);
+                if (fread(w.code.data(), 1, code_size, f) != code_size) break;
+                warm_seen_.emplace(w.key, 1);
+                out.push_back(std::move(w));
+            }
+        }
+        fclose(f);
+        return out;
+    }
+    // Before the game starts: translates the recorded shaders that the disk cache does not have (at most 30 s).
+    // Warm-up runs a little at a time, once per presented frame (WarmupStep), so the screen keeps moving; the
+    // progress is drawn on the screen until the recorded shaders are all checked.
+    std::vector<WarmRec> warm_recs_;
+    size_t warm_pos_ = 0;
+    std::atomic<int> warm_permille_{-1};  // -1: nothing to show; 0..1000: progress drawn on the screen
+    std::chrono::steady_clock::time_point warm_t0_;
+    uint64_t total_warm_translated_ = 0;
+
+    void WarmupShaders() {
+        warm_recs_ = ReadWarm();
+        warm_pos_ = 0;
+        if (warm_recs_.empty()) return;
+        warm_t0_ = std::chrono::steady_clock::now();
+        warm_permille_.store(0);
+        LOGI(kTag, "warm-up: %zu recorded shaders to check before the game is shown", warm_recs_.size());
+    }
+    void WarmupStep(double budget_ms) {
+        if (warm_permille_.load() < 0) return;
+        const auto t0 = std::chrono::steady_clock::now();
+        while (warm_pos_ < warm_recs_.size()) {
+            const WarmRec& w = warm_recs_[warm_pos_++];
+            if (!shader_disk_.count(w.key)) {
+                shader::TranslateResult r = shader::Translate(w.code.data(), w.code.size(), w.opt);
+                if (r.ok) {
+                    shader_disk_[w.key] = CachedShader{r.spirv, r.info};
+                    AppendShaderCache(w.key, r);
+                    total_warm_translated_++;
+                }
+            }
+            if (std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() > budget_ms)
+                break;
+        }
+        if (warm_pos_ >= warm_recs_.size()) {
+            const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - warm_t0_).count();
+            LOGI(kTag, "warm-up: done, %llu shaders translated before the game (%.1f s)",
+                 (unsigned long long)total_warm_translated_, secs);
+            warm_permille_.store(-1);
+            warm_recs_.clear();
+            warm_recs_.shrink_to_fit();
+        } else {
+            warm_permille_.store(int(warm_pos_ * 1000 / warm_recs_.size()));
+        }
+    }
+
+
     Shader* GetShader(const ShaderCode& code, const shader::TranslateOptions& opt) {
         const uint32_t parts[6] = {uint32_t(code.hash), uint32_t(code.hash >> 32), opt.int_attrib_mask,
                                    opt.signed_attrib_mask, uint32_t(opt.gl_depth_range),
@@ -3829,7 +4357,22 @@ private:
             return &it->second;
         }
         Shader& s = shaders_[key];
-        shader::TranslateResult r = shader::Translate(code.code.data(), code.code.size(), opt);
+        shader::TranslateResult r;
+        const auto disk = shader_disk_.find(key);
+        if (disk != shader_disk_.end()) {
+            r.ok = true;
+            r.spirv = disk->second.spirv;
+            r.info = disk->second.info;
+            shader_cache_hits_++;
+        } else {
+            r = shader::Translate(code.code.data(), code.code.size(), opt);
+            shader_cache_misses_++;
+            if (r.ok) {
+                shader_disk_[key] = CachedShader{r.spirv, r.info};
+                AppendShaderCache(key, r);
+                RememberForWarmup(code, opt, key);
+            }
+        }
         if (!r.ok) {
             s.error = r.error;
             if (shader_failures_logged_++ < 24)
@@ -4149,6 +4692,18 @@ private:
                                        HasDepth(depth_peek->nvn_format) && st_.depth.depth_test && !st_.depth.depth_write &&
                                        st_.program[1] && st_.depth.depth_func != 8 && !debug_fx;
         if (shader_depth_test) fopt.depth_test_func = st_.depth.depth_func;
+        // shadow_quality 0: the shadow map pass (depth only, square target, nothing else bound) is not drawn. The
+        // lookups are answered "lit" by the sampler (see Sampler), so the map's contents do not matter.
+        if (dsr::GetRuntime().config.shadow_quality == 0 && st_.num_rt == 0 && !st_.program[1] && depth_peek &&
+            depth_peek->width == depth_peek->height && depth_peek->width >= 256 && depth_peek->width <= 2048 &&
+            IsDepthFormat(depth_peek->nvn_format))
+        {
+            if (!shadow_skip_logged_) {
+                shadow_skip_logged_ = true;
+                LOGI(kTag, "shadow_quality 0: the shadow map pass (%dx%d) is not drawn", depth_peek->width, depth_peek->height);
+            }
+            return;
+        }
         Shader* vs = GetShader(*st_.program[0], vopt);
         // No pixel program: a depth-only pass (shadow maps, depth prepass). Draw with the vertex stage only.
         Shader* fs = st_.program[1] ? GetShader(*st_.program[1], fopt) : &no_fragment_;
@@ -4206,6 +4761,37 @@ private:
         // Keep enough streaming space for this draw so nothing allocated below is lost to a flush.
         if (StreamRemaining() < (16ull << 20)) Flush();
 
+        // ---- hud_full_res: the game's HUD and menus drawn at the screen's resolution -------------------------
+        // The game draws its HUD (blended 2D draws) on a target of its frame size (`T`), and a final pass then turns T
+        // into the frame it presents. The first HUD draw on T enlarges the 3D picture made so far into a screen-sized
+        // image (hud_img_); that draw and every later one on T go into that image instead, with their viewport and
+        // scissor scaled. The final pass then reads hud_img_ instead of T and renders into a second screen-sized
+        // image (hud2_img_), which Present shows. A T that is presented as it is needs no final pass. A T is only
+        // redirected once a frame has shown how it reaches the screen (hud_sources_); anything else stays as it was.
+        bool hud_redirect = false, hud_boxed = false, samples_t = false, sampled_cand = false;
+        if (hud_w_ > 0 && !colors.empty() && colors[0] && HudTarget(colors, depth)) {
+            Image* f = colors[0];
+            const int cls = HudClass(p, vin);
+            if (cls && !hud_started_ && !hud_sources_.count(f->addr)) {
+                // A HUD draw on a target not known yet: it is a source if the game presents it as it is, or if a
+                // later draw of the frame reads it to make a presented frame (the final pass, see below).
+                hud_cand_addr_ = f->addr;
+                if (presented_addrs_.count(f->addr)) hud_sources_.insert(f->addr);
+            }
+            if (hud_sources_.count(f->addr)) {
+                if (!hud_started_ && cls) {
+                    hud_started_ = HudStart(*f);
+                    if (!hud_started_) hud_w_ = 0;  // could not make the image: the rest of this frame is drawn as before
+                }
+                if (hud_started_ && hud_t_addr_ == f->addr) {
+                    hud_redirect = true;
+                    hud_boxed = cls == 1 && hud_box_w_ > 0;
+                    colors[0] = &hud_img_;
+                    hud_redirected_++;
+                }
+            }
+        }
+
         Phase(1);
         // ---- textures (uploads and layout changes happen outside rendering) ---------------------------------
         std::vector<TexWrite>& tex_writes = scratch_tex_writes_;  // members: no allocation per draw
@@ -4241,6 +4827,13 @@ private:
                     bt.texture.tex.swizzle[2] = 4;
                     bt.texture.tex.swizzle[3] = 5;
                     if (!img) return Skip("no stand-in texture");
+                }
+                // hud_full_res: what the game reads as this frame's picture is the enlarged one with the HUD on it.
+                if (hud_started_ && img->addr == hud_t_addr_ && img != &hud_img_ && img != &hud2_img_) {
+                    img = &hud_img_;
+                    samples_t = true;
+                } else if (hud_cand_addr_ && !hud_started_ && img->addr == hud_cand_addr_) {
+                    sampled_cand = true;
                 }
                 for (Image* c : colors)
                     if (c == img) return Skip("texture is also a render target");
@@ -4328,6 +4921,23 @@ private:
                                                                          Filterable(*img)),
                                            view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}});
             }
+        }
+
+        // hud_full_res, the frame's final pass: the draw that reads the HUD's target and renders to a frame the game
+        // presents. Learned the first time (the HUD target is then a source from the next frame on); with the HUD
+        // started, the pass reads the enlarged picture (above) and renders into a second screen-sized image.
+        bool hud_final_pending = false;
+        if (sampled_cand && !colors.empty() && colors[0] && presented_addrs_.count(colors[0]->addr) &&
+            colors[0]->width == hud_src_w_ && colors[0]->height == hud_src_h_ && hud_sources_.insert(hud_cand_addr_).second)
+            LOGI(kTag, "hud_full_res: the HUD's target @%llx is turned into the presented frame @%llx by a final pass: "
+                 "the HUD is drawn at full resolution from now on", (unsigned long long)hud_cand_addr_,
+                 (unsigned long long)colors[0]->addr);
+        if (samples_t && hud_w_ > 0 && !colors.empty() && colors[0] && !hud_redirect && HudTarget(colors, depth) &&
+            presented_addrs_.count(colors[0]->addr) && HudEnsureImage(hud2_img_, *colors[0])) {
+            hud_final_pending = hud_redirect = true;
+            hud_boxed = false;
+            colors[0] = &hud2_img_;
+            if (!hud_final_) hud2_img_.written = false;  // the pass covers all of it: nothing to load
         }
 
         // Storage images the fragment shader writes (SUST). Kept in GENERAL layout while bound.
@@ -4681,23 +5291,28 @@ private:
         Phase(5);
         // ---- queue the draw: the recorder thread builds its descriptor sets and records it --------------------
         if (!EnsureRendering(colors, depth, &extent)) return Skip("no render target");
+        if (hud_final_pending) hud_final_ = true;
         if (depth && fs->info.writes_depth && st_.depth.depth_write) depth->depth_exported = depth->fragdepth_written = true;
         DrawPacket d;
         d.pipeline = pipeline;
         d.layout = layout;
         d.set_layouts[0] = vsl;
         d.set_layouts[1] = fsl;
-        DynamicState(extent, modes, &d.dyn);
+        // Redirected HUD draws are laid out in the game's frame (hud_src_w_ x hud_src_h_) and scaled up afterwards.
+        const int ew = hud_redirect ? hud_src_w_ : int(extent.width), eh = hud_redirect ? hud_src_h_ : int(extent.height);
+        DynamicState(hud_redirect ? VkExtent2D{uint32_t(ew), uint32_t(eh)} : extent, modes, &d.dyn);
         // Other aspect ratios (aspect_ratio): the game lays its HUD and menus out for 1280x720 and stretches that
         // over the whole (wider or narrower) frame. Every draw made with that 1280x720 2D projection (several
         // shaders: quads, text, bars) goes into a centred 16:9 box instead: 1280x720 in the middle of wider frames,
         // the full width and 9/16 of it high on narrower ones, so the HUD keeps its shape and layout. Full-screen
         // quads (fades, dimming behind menus) still cover the whole frame.
-        if (hud_box_w_ && int(extent.height) == dsr::GetRuntime().config.render_height &&
-            int(extent.width) == dsr::GetRuntime().config.render_width && HudBoxed(p, vin)) {
-            const int fh = int(extent.height);
-            const float sx = float(hud_box_w_) / float(extent.width), sy = float(hud_box_h_) / float(fh);
-            const float x0 = float((int(extent.width) - hud_box_w_) / 2), y0 = float((fh - hud_box_h_) / 2);
+        const bool boxed = hud_redirect ? hud_boxed
+                                        : (hud_box_w_ && int(extent.height) == dsr::GetRuntime().config.render_height &&
+                                           int(extent.width) == dsr::GetRuntime().config.render_width && HudBoxed(p, vin));
+        if (boxed) {
+            const int fh = eh;
+            const float sx = float(hud_box_w_) / float(ew), sy = float(hud_box_h_) / float(fh);
+            const float x0 = float((ew - hud_box_w_) / 2), y0 = float((fh - hud_box_h_) / 2);
             d.dyn.vp.x = x0 + d.dyn.vp.x * sx;
             d.dyn.vp.width *= sx;
             d.dyn.vp.y = y0 + d.dyn.vp.y * sy;
@@ -4707,14 +5322,14 @@ private:
             VkRect2D& sc = d.dyn.sc;
             float l = x0, t = y0, r = x0 + float(hud_box_w_), b = y0 + float(hud_box_h_);
             if (st_.scissor_set && st_.scissor[2] > 0 && st_.scissor[3] > 0 &&
-                !(st_.scissor[0] <= 0 && st_.scissor[1] <= 0 && st_.scissor[2] >= int(extent.width) &&
-                  st_.scissor[3] >= int(extent.height))) {
+                !(st_.scissor[0] <= 0 && st_.scissor[1] <= 0 && st_.scissor[2] >= ew &&
+                  st_.scissor[3] >= eh)) {
                 const float kx = float(hud_box_w_) / 1280.0f, ky = float(hud_box_h_) / 720.0f;
                 l = std::max(l, x0 + float(st_.scissor[0]) * kx);
                 t = std::max(t, y0 + float(st_.scissor[1]) * ky);
                 // The game cuts its rectangles at the frame's edges (960 on a 4:3 frame, 540 high at a 0.75 render
                 // scale), which in layout units are not the layout's edges: one ending there runs to them.
-                const float right = st_.scissor[0] + st_.scissor[2] >= float(extent.width) - 0.5f
+                const float right = st_.scissor[0] + st_.scissor[2] >= float(ew) - 0.5f
                                         ? 1280.0f : st_.scissor[0] + st_.scissor[2];
                 const float bottom = st_.scissor[1] + st_.scissor[3] >= float(fh) - 0.5f
                                          ? 720.0f : st_.scissor[1] + st_.scissor[3];
@@ -4725,6 +5340,19 @@ private:
             sc.offset = {il, it};
             sc.extent = {uint32_t(std::max(0, ir - il)), uint32_t(std::max(0, ib - it))};
             hud_draws_boxed_++;
+        }
+        if (hud_redirect) {  // the game's frame -> the screen-sized image
+            const float kx = float(hud_w_) / float(ew), ky = float(hud_h_) / float(eh);
+            d.dyn.vp.x *= kx;
+            d.dyn.vp.width *= kx;
+            d.dyn.vp.y *= ky;
+            d.dyn.vp.height *= ky;
+            VkRect2D& sc2 = d.dyn.sc;
+            const int l = int(std::floor(float(sc2.offset.x) * kx)), t = int(std::floor(float(sc2.offset.y) * ky));
+            const int r = std::min(hud_w_, int(std::ceil(float(sc2.offset.x + int(sc2.extent.width)) * kx)));
+            const int b = std::min(hud_h_, int(std::ceil(float(sc2.offset.y + int(sc2.extent.height)) * ky)));
+            sc2.offset = {l, t};
+            sc2.extent = {uint32_t(std::max(0, r - l)), uint32_t(std::max(0, b - t))};
         }
         d.push[0] = st_.alpha_ref;
         d.indexed = use_indices;
@@ -6300,8 +6928,104 @@ private:
         if (full) hud_full_screen_++;
         return !full;
     }
+    // ---- hud_full_res ------------------------------------------------------------------------------------------
+    // Size of the screen-sized HUD image for a game frame (0 = the feature is off, or the screen is not much bigger
+    // than the frame): the frame's aspect ratio fitted into the window.
+    void HudUpdateSize(const Image& f) {
+        int w = 0, h = 0;
+        if (dsr::GetRuntime().config.hud_full_res && win_w_ > 0 && win_h_ > 0 && f.width > 0 && f.height > 0) {
+            const double k = std::min(double(win_w_) / f.width, double(win_h_) / f.height);
+            if (k >= 1.2) {
+                w = int(std::lround(f.width * k));
+                h = int(std::lround(f.height * k));
+            }
+        }
+        hud_w_ = w;
+        hud_h_ = h;
+        hud_src_w_ = w ? f.width : 0;
+        hud_src_h_ = w ? f.height : 0;
+    }
+    // Whether a draw renders only to one target of the game's frame size (no depth, a plain view): the draws
+    // hud_full_res can redirect.
+    bool HudTarget(const std::vector<Image*>& colors, const Image* depth) const {
+        const Image* f = colors[0];
+        if (depth || !f || f->width != hud_src_w_ || f->height != hud_src_h_ || f->levels != 1 || f->layers != 1)
+            return false;
+        if (st_.rts.empty() || st_.rts[0].view_format || st_.rts[0].layer || st_.rts[0].level) return false;
+        for (size_t i = 1; i < colors.size(); i++)
+            if (colors[i]) return false;
+        return true;
+    }
+    // 0 = not a blended 2D HUD / menu draw; 1 = one that stays in the 16:9 box (hud_box); 2 = a blending full-screen
+    // one (fades, dimming behind menus). Same tests as HudBoxed.
+    int HudClass(const DrawParams& p, const VertexInput& vin) {
+        float sx, sy;
+        if (!Projection2D(&sx, &sy) || std::fabs(sx - 2.0f / 1280.0f) > 1e-6f || std::fabs(sy + 2.0f / 720.0f) > 1e-6f)
+            return 0;
+        if (!(st_.color.blend_enable & 1)) return 0;
+        float x0, x1, y0, y1;
+        if (!DrawBounds(p, vin, &x0, &x1, &y0, &y1)) return 1;
+        return (x0 <= 2.0f && x1 >= 1278.0f && y0 <= 2.0f && y1 >= 718.0f) ? 2 : 1;
+    }
+    // A screen-sized image like the game frame `f` in `slot`, made (again) when its size or format changed.
+    bool HudEnsureImage(Image& slot, const Image& f) {
+        if (slot.image && slot.width == hud_w_ && slot.height == hud_h_ && slot.vk_format == f.vk_format) return true;
+        if (slot.image) DestroyImage(slot);  // retired: destroyed once the GPU is done with it
+        Image h;
+        h.vk_format = f.vk_format;
+        h.nvn_format = f.nvn_format;
+        h.target = f.target;
+        h.type = VK_IMAGE_TYPE_2D;
+        h.width = hud_w_;
+        h.height = hud_h_;
+        h.aspect = f.aspect;
+        h.features = f.features;
+        if (!(h.features & VK_FORMAT_FEATURE_BLIT_DST_BIT) || !(h.features & VK_FORMAT_FEATURE_BLIT_SRC_BIT)) return false;
+        if (!AllocImage(h, false, false, &h.image, &h.memory)) return false;
+        slot = std::move(h);
+        LOGI(kTag, "hud_full_res: %s image %dx%d (the game's frame is %dx%d)", &slot == &hud_img_ ? "HUD" : "final pass",
+             hud_w_, hud_h_, f.width, f.height);
+        return true;
+    }
+    // Enlarges the 3D picture drawn so far on `f` into the HUD image; the frame's HUD draws then go there.
+    bool HudStart(Image& f) {
+        if (!HudEnsureImage(hud_img_, f)) return false;
+        EndRendering();
+        Transition(f, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        Transition(hud_img_, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        VkImageBlit b{};
+        b.srcSubresource = {f.aspect, 0, 0, 1};
+        b.srcOffsets[1] = {f.width, f.height, 1};
+        b.dstSubresource = {hud_img_.aspect, 0, 0, 1};
+        b.dstOffsets[1] = {hud_w_, hud_h_, 1};
+        const VkFilter filter = (dsr::GetRuntime().config.scale_filter == 0 ||
+                                 !(f.features & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT))
+                                    ? VK_FILTER_NEAREST
+                                    : VK_FILTER_LINEAR;
+        Rec([b, filter, si = f.image, di = hud_img_.image](VkCommandBuffer cb) {
+            vkCmdBlitImage(cb, si, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, di, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b,
+                           filter);
+        });
+        hud_img_.written = true;
+        hud_t_addr_ = f.addr;
+        return true;
+    }
+    Image hud_img_;                 // the game's frame enlarged to the screen, with the HUD drawn on it
+    int hud_w_ = 0, hud_h_ = 0;     // its size (0 = hud_full_res not in use)
+    int hud_src_w_ = 0, hud_src_h_ = 0;  // the game frame size it was sized from
+    Image hud2_img_;                // the final pass's output at the screen's size (when the HUD target is not presented)
+    uint64_t hud_t_addr_ = 0;       // the target the current picture was enlarged from (the one the HUD is drawn on)
+    uint64_t hud_cand_addr_ = 0;    // this frame: a HUD draw was seen on this target, not yet known as a source
+    std::unordered_set<uint64_t> hud_sources_;  // HUD targets that reach the screen (learned), see Draw
+    int hud_orphans_ = 0;
+    bool hud_final_ = false;        // this frame's final pass was drawn into hud2_img_ (reset by Present)
+    bool hud_started_ = false;      // this frame's HUD goes into hud_img_ (reset by Present)
+    uint64_t hud_redirected_ = 0;
+    std::unordered_set<uint64_t> presented_addrs_;  // frame textures the game has presented
+    int win_w_ = 0, win_h_ = 0;     // the window's size (EnsureSwapchain)
     bool bc_patched_ = false, bc_forced_ = false;
     bool mip_skip_ = false;      // settings texture_mip_skip
+    bool shadow_skip_logged_ = false;
     uint64_t mip_skipped_ = 0;   // images created without their top level
     int hud_box_w_ = 0, hud_box_h_ = 0;
     std::unordered_set<uint64_t> hud_box_logged_;

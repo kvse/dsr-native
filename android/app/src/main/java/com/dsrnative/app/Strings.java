@@ -205,11 +205,79 @@ final class Strings {
                 "자동은 기기가 유지할 수 있는 60, 30, 20 FPS 중에서 고르며 게임 속도는 정상으로 유지합니다.",
                 "自动会根据设备的承受能力选择 60、30 或 20 FPS，并保持游戏正常速度。",
                 "自動會依裝置可維持的程度選擇 60、30 或 20 FPS，並保持遊戲正常速度。");
+        put("minfps_t", "Lowest auto frame rate", "Plus bas en mode Auto", "Niedrigste Auto-Bildrate",
+                "Frame rate minimo in Auto", "Mínimo en modo Auto", "Mínimo no modo Auto",
+                "Минимум в режиме Авто", "自動の最低フレームレート", "자동 최저 프레임 속도", "自动模式最低帧率", "自動模式最低幀率");
+        put("minfps_n", "Only with Auto: the slowest rate Auto may drop to. Lower looks smoother on weak devices, but the game runs slower.",
+                "Seulement avec Auto : le taux le plus bas qu'Auto peut atteindre. Plus bas = plus fluide sur les appareils faibles, mais jeu plus lent.",
+                "Nur bei Auto: die niedrigste Rate, auf die Auto fallen darf. Niedriger wirkt flüssiger auf schwachen Geräten, das Spiel läuft dafür langsamer.",
+                "Solo con Auto: la velocità più bassa a cui Auto può scendere. Più bassa = più fluida sui dispositivi deboli, ma gioco più lento.",
+                "Solo con Auto: la velocidad más baja a la que puede bajar Auto. Más baja = más fluida en equipos débiles, pero el juego va más lento.",
+                "Só com Auto: a menor taxa a que o Auto pode cair. Mais baixa = mais fluida em aparelhos fracos, mas o jogo fica mais lento.",
+                "Только для Авто: самая низкая частота, до которой может опускаться Авто. Ниже — плавнее на слабых устройствах, но игра замедляется.",
+                "自動のときのみ：自動が下げる最低のレートです。低いほど弱い機種で滑らかですが、ゲームは遅くなります。",
+                "자동일 때만: 자동이 내려갈 수 있는 최저 속도입니다. 낮을수록 약한 기기에서 부드럽지만 게임이 느려집니다.",
+                "仅自动模式：自动可降到的最低帧率。越低在弱机上越流畅，但游戏会变慢。",
+                "僅自動模式：自動可降到的最低幀率。越低在弱機上越流暢，但遊戲會變慢。");
+        put("scalef_t", "Upscale filter", "Filtre d'agrandissement", "Vergrößerungsfilter", "Filtro di ingrandimento",
+                "Filtro de ampliación", "Filtro de ampliação", "Фильтр увеличения", "拡大フィルター", "확대 필터", "放大滤镜", "放大濾鏡");
+        put("scalef_n", "Smooths the enlarged picture (bilinear) or keeps pixels sharp (nearest). Bicubic and FXAA need shaders: not yet.",
+                "Lisse l'image agrandie (bilinéaire) ou garde les pixels nets (proche). Bicubique et FXAA demandent des shaders : pas encore.",
+                "Glättet das vergrößerte Bild (bilinear) oder hält die Pixel scharf (nächster Nachbar). Bikubisch und FXAA brauchen Shader: noch nicht.",
+                "Leviga l'immagine ingrandita (bilineare) o mantiene i pixel nitidi (vicino). Bicubico e FXAA richiedono shader: non ancora.",
+                "Suaviza la imagen ampliada (bilineal) o mantiene los píxeles nítidos (vecino). Bicúbico y FXAA necesitan shaders: aún no.",
+                "Suaviza a imagem ampliada (bilinear) ou mantém os pixels nítidos (vizinho). Bicúbico e FXAA precisam de shaders: ainda não.",
+                "Сглаживает увеличенное изображение (билинейный) или сохраняет пиксели четкими (ближайший). Бикубический и FXAA требуют шейдеров: пока нет.",
+                "拡大画像を滑らかにします（バイリニア）。ピクセルを鮮明に保つ場合はニアレスト。バイキュービックとFXAAはシェーダーが必要で、まだ未対応です。",
+                "확대된 화면을 부드럽게(바이리니어) 또는 픽셀을 선명하게(니어리스트) 유지합니다. 바이큐빅과 FXAA는 셰이더가 필요해 아직 없습니다.",
+                "平滑放大后的画面（双线性），或保持像素锐利（最近邻）。双三次和FXAA需要着色器，暂不可用。",
+                "平滑放大後的畫面（雙線性），或保持像素銳利（最近鄰）。雙三次和FXAA需要著色器，暫不可用。");
+        put("hudres_t", "Sharp HUD and menus", "HUD et menus nets", "Scharfes HUD und Menüs", "HUD e menu nitidi",
+                "HUD y menús nítidos", "HUD e menus nítidos", "Четкий HUD и меню", "HUDとメニューを鮮明に", "선명한 HUD와 메뉴",
+                "清晰的HUD和菜单", "清晰的HUD和選單");
+        put("hudres_n",
+                "Draws the game's HUD, menus and text at the screen's full resolution, whatever the render scale. Costs a little GPU time.",
+                "Dessine l'interface, les menus et les textes du jeu à la résolution complète de l'écran, quelle que soit l'échelle de rendu. Coûte un peu de GPU.",
+                "Zeichnet HUD, Menüs und Texte des Spiels in der vollen Bildschirmauflösung, unabhängig von der Render-Skalierung. Kostet etwas GPU-Zeit.",
+                "Disegna HUD, menu e testi del gioco alla risoluzione piena dello schermo, qualunque sia la scala di rendering. Costa un po' di GPU.",
+                "Dibuja el HUD, los menús y los textos del juego a la resolución completa de la pantalla, sea cual sea la escala de renderizado. Cuesta algo de GPU.",
+                "Desenha o HUD, os menus e os textos do jogo na resolução total da tela, seja qual for a escala de renderização. Custa um pouco de GPU.",
+                "Рисует HUD, меню и текст игры в полном разрешении экрана независимо от масштаба рендера. Немного нагружает GPU.",
+                "ゲームのHUD・メニュー・文字を、レンダースケールに関係なく画面の最大解像度で描画します。GPU負荷が少し増えます。",
+                "렌더 스케일과 관계없이 게임의 HUD, 메뉴, 텍스트를 화면 전체 해상도로 그립니다. GPU를 조금 더 사용합니다.",
+                "无论渲染比例如何，都以屏幕的完整分辨率绘制游戏的HUD、菜单和文字。会略微增加GPU负担。",
+                "無論渲染比例如何，都以螢幕的完整解析度繪製遊戲的HUD、選單和文字。會略微增加GPU負擔。");
+        put("scalef_0", "Nearest", "Pixels nets", "Nächster Nachbar", "Vicino", "Vecino más cercano", "Vizinho mais próximo",
+                "Ближайший", "ニアレスト", "니어리스트", "最近邻", "最近鄰");
+        put("scalef_1", "Bilinear", "Bilinéaire", "Bilinear", "Bilineare", "Bilineal", "Bilinear", "Билинейный",
+                "バイリニア", "바이리니어", "双线性", "雙線性");
         put("tab_graphics", "Graphics", "Graphismes", "Grafik", "Grafica", "Gráficos", "Gráficos", "Графика", "グラフィック",
                 "그래픽", "图形", "圖形");
         put("sec_game", "Game", "Jeu", "Spiel", "Gioco", "Juego", "Jogo", "Игра", "ゲーム", "게임", "游戏", "遊戲");
         put("sec_quality", "Quality", "Qualité", "Qualität", "Qualità", "Calidad", "Qualidade", "Качество", "画質", "품질",
                 "画质", "畫質");
+        // en, fr, de, it, es, pt (other languages show the English text)
+        put("shadow_t", "Shadows", "Ombres", "Schatten", "Ombre", "Sombras", "Sombras");
+        put("shadow_n",
+                "Shadow map quality. Off skips the shadow pass completely: the biggest saving on weak GPUs.",
+                "Qualité des cartes d'ombres. Désactivé supprime entièrement la passe d'ombres : le plus gros gain sur les GPU faibles.",
+                "Qualität der Schattenkarten. Aus überspringt die Schattenpassage komplett: die größte Ersparnis bei schwachen GPUs.",
+                "Qualità delle mappe d'ombra. Disattivato salta del tutto il passaggio delle ombre: il risparmio maggiore sulle GPU deboli.",
+                "Calidad de los mapas de sombras. Desactivado omite por completo el pase de sombras: el mayor ahorro en GPUs débiles.",
+                "Qualidade dos mapas de sombra. Desligado ignora totalmente a passagem de sombras: a maior economia em GPUs fracas.");
+        put("q_high", "High (2048)", "Élevée (2048)", "Hoch (2048)", "Alta (2048)", "Alta (2048)", "Alta (2048)");
+        put("q_medium", "Medium (1024)", "Moyenne (1024)", "Mittel (1024)", "Media (1024)", "Media (1024)", "Média (1024)");
+        put("q_low", "Low (512)", "Faible (512)", "Niedrig (512)", "Bassa (512)", "Baja (512)", "Baixa (512)");
+        put("q_off", "Off", "Désactivé", "Aus", "Disattivato", "Desactivadas", "Desligado");
+        put("loweff_t", "Low-quality effects", "Effets basse qualité", "Effekte in niedriger Qualität",
+                "Effetti a bassa qualità", "Efectos de baja calidad", "Efeitos de baixa qualidade");
+        put("loweff_n",
+                "Smoke, fog and glow use the game's cheaper path.",
+                "Fumée, brouillard et lueurs utilisent le chemin moins coûteux du jeu.",
+                "Rauch, Nebel und Leuchten nutzen den günstigeren Weg des Spiels.",
+                "Fumo, nebbia e bagliori usano il percorso più leggero del gioco.",
+                "Humo, niebla y brillos usan la ruta más ligera del juego.",
+                "Fumaça, névoa e brilhos usam o caminho mais leve do jogo.");
         put("perf_t", "Performance mode", "Mode performance", "Leistungsmodus", "Modalità prestazioni",
                 "Modo rendimiento", "Modo desempenho", "Режим производительности", "パフォーマンスモード", "성능 모드",
                 "性能模式", "效能模式");
