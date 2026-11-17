@@ -76,6 +76,16 @@ file is complete even after a crash. The same output also goes to logcat (`adb l
 
 
 
+## ETC2 disk cache
+
+GPUs without BC texture support (Mali, PowerVR) get the game's textures converted to ETC2 on the CPU, which is the
+main cost of visiting a new area. The converted textures are now kept in `Download/DSRNative/cache/` (`etc2_cache.dat`
+and `etc2_cache.idx`), so the next run reads them back instead of converting them again: the first visit to an area is
+still slow, the following runs are not. `etc_disk_cache_mb` in `settings.txt` sets the size limit in MB (default 1024,
+0 = off); when it is full, new textures are no longer stored. Delete the two files to start over (they are also
+discarded automatically when the converter changes). The log line `ETC2 disk cache: ... levels read back` shows how
+much of a run came from the cache.
+
 ## Installing game files on the device
 **Method 1**
 > [!IMPORTANT]

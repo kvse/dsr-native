@@ -1,0 +1,81 @@
+--- src/hle/nvn/vk_backend.cpp	2026-11-17 03:35:49.096115961 +0000
++++ src/hle/nvn/vk_backend.cpp	2026-11-17 03:38:06.672367080 +0000
+@@ -46,6 +46,7 @@
+ #include "common/platform.h"
+ #include "hle/nvn/backend.h"
+ #include "hle/nvn/bc_decode.h"
++#include "hle/nvn/etc_disk_cache.h"
+ #include "hle/nvn/etc_encode.h"
+ #include "hle/nvn/parallel.h"
+ #include "runtime/runtime.h"
+@@ -2369,6 +2370,7 @@
+         uint8_t* out;
+         size_t out_bytes;
+         uint64_t key;  // ETC2 cache key (0: not cached)
++        uint64_t tag = 0;  // second hash of the source blocks, for the disk cache (0: disk cache off)
+     };
+     struct BcTask {
+         uint32_t job;
+@@ -2383,6 +2385,8 @@
+     static constexpr size_t kEtcCacheLimit = 96u << 20;
+     double bc_convert_ms_ = 0;     // conversion time, for the stats line
+     uint64_t bc_cache_hits_ = 0, bc_converted_levels_ = 0;
++    uint64_t bc_disk_hits_ = 0;   // levels read back from the on-disk ETC2 cache
++    double bc_disk_ms_ = 0;       // time those reads took (they run on the render thread)
+ 
+     void RunBcJobs() {
+         if (bc_jobs_.empty()) return;
+@@ -2431,6 +2435,7 @@
+             auto& e = etc_cache_[j.key];
+             etc_cache_bytes_ += j.out_bytes - e.size();
+             e.assign(j.out, j.out + j.out_bytes);
++            if (j.tag) EtcDiskCache::Get().Store(j.key, j.tag, e.data(), e.size());  // written on its own thread
+         }
+         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+         bc_convert_ms_ += ms;
+@@ -2513,6 +2518,21 @@
+                             memcpy(job.out, hit->second.data(), out_bytes);
+                             bc_cache_hits_++;
+                             cached = true;
++                        } else {
++                            // Not in memory: converted in an earlier run? (opened on first use)
++                            const dsr::RuntimeConfig& rc = dsr::GetRuntime().config;
++                            EtcDiskCache& disk = EtcDiskCache::Get();
++                            disk.Open(rc.cache_dir, uint64_t(std::max(0, rc.etc_disk_cache_mb)) << 20);
++                            if (disk.Enabled()) {
++                                const auto d0 = std::chrono::steady_clock::now();
++                                job.tag = EtcDiskCache::Tag(blocks, n);
++                                if (disk.Lookup(job.key, job.tag, job.out, out_bytes)) {
++                                    bc_disk_hits_++;
++                                    cached = true;
++                                }
++                                bc_disk_ms_ += std::chrono::duration<double, std::milli>(
++                                                   std::chrono::steady_clock::now() - d0).count();
++                            }
+                         }
+                     }
+                     if (!cached) bc_jobs_.push_back(job);
+@@ -5856,12 +5876,20 @@
+         for (auto& [reason, n] : skipped_) skipped += " | " + std::to_string(n) + " " + reason;
+         LOGI(kTag, "draws: %llu drawn, %zu pipelines, %d shaders, %d uploads, %d flushes%s", (unsigned long long)drawn_,
+              pipelines_.size(), shaders_translated_, uploads_, flushes_, skipped.c_str());
+-        if (bc_converted_levels_ || bc_cache_hits_) {
++        if (bc_converted_levels_ || bc_cache_hits_ || bc_disk_hits_) {
+             LOGI(kTag, "BC textures converted on the CPU: %llu levels in %.0f ms, %llu from the ETC2 cache (%.0f MB)",
+                  (unsigned long long)bc_converted_levels_, bc_convert_ms_, (unsigned long long)bc_cache_hits_,
+                  etc_cache_bytes_ / 1048576.0);
+-            bc_converted_levels_ = bc_cache_hits_ = 0;
+-            bc_convert_ms_ = 0;
++            if (EtcDiskCache::Get().Enabled()) {
++                const EtcDiskCache::Stats ds = EtcDiskCache::Get().GetStats();
++                LOGI(kTag, "ETC2 disk cache: %llu levels read back in %.0f ms; on disk %llu levels, %.0f MB "
++                           "(%llu stored, %llu dropped, %llu corrupt in total)",
++                     (unsigned long long)bc_disk_hits_, bc_disk_ms_, (unsigned long long)ds.entries,
++                     ds.data_bytes / 1048576.0, (unsigned long long)ds.stored, (unsigned long long)ds.dropped,
++                     (unsigned long long)ds.corrupt);
++            }
++            bc_converted_levels_ = bc_cache_hits_ = bc_disk_hits_ = 0;
++            bc_convert_ms_ = bc_disk_ms_ = 0;
+         }
+         {
+             long rss_kb = 0;

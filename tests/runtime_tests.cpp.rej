@@ -1,0 +1,175 @@
+--- tests/runtime_tests.cpp	2026-11-17 03:35:49.097685181 +0000
++++ tests/runtime_tests.cpp	2026-11-17 03:38:06.673366058 +0000
+@@ -5,10 +5,14 @@
+ #include <cstdlib>
+ #include <cstring>
+ #include <random>
++#include <string>
+ #include <thread>
+ #include <tuple>
+ #include <vector>
+ 
++#include <sys/stat.h>
++#include <unistd.h>
++
+ #include "arch/arch.h"
+ #include "hle/nvn.h"
+ #include "hle/nvn/backend.h"
+@@ -21,6 +25,7 @@
+ #include "loader/sha256.h"
+ 
+ static int g_failures = 0;
++#include "hle/nvn/etc_disk_cache.h"
+ #include "hle/nvn/etc_encode.h"
+ #include "hle/nvn/parallel.h"
+ 
+@@ -617,6 +622,141 @@
+     CHECK(once);
+ }
+ 
++static void TestEtcDiskCache() {
++    using dsr::hle::nvn::EtcDiskCache;
++    char tmpl[] = "/tmp/dsr_etc_cache_XXXXXX";
++    const char* dir = mkdtemp(tmpl);
++    CHECK(dir != nullptr);
++    if (!dir) return;
++    const std::string d = dir;
++    std::mt19937 rng(1234);
++    struct Level { uint64_t key, tag; std::vector<uint8_t> data; };
++    std::vector<Level> levels;
++    for (int i = 0; i < 200; i++) {
++        Level l;
++        l.key = (uint64_t(rng()) << 32 | rng()) | 1;
++        l.tag = uint64_t(rng()) << 32 | rng();
++        l.data.resize(8 + rng() % 5000);
++        for (auto& b : l.data) b = uint8_t(rng());
++        levels.push_back(std::move(l));
++    }
++    {   // store, read back
++        EtcDiskCache c;
++        c.Open(d, 64u << 20);
++        CHECK(c.Enabled());
++        for (auto& l : levels) c.Store(l.key, l.tag, l.data.data(), l.data.size());
++        c.Flush();
++        bool all = true;
++        for (auto& l : levels) {
++            std::vector<uint8_t> out(l.data.size());
++            all = all && c.Lookup(l.key, l.tag, out.data(), out.size()) && out == l.data;
++        }
++        CHECK(all);
++        std::vector<uint8_t> out(levels[0].data.size());
++        CHECK(!c.Lookup(levels[0].key, levels[0].tag ^ 1, out.data(), out.size()));      // other source blocks
++        CHECK(!c.Lookup(levels[0].key, levels[0].tag, out.data(), out.size() - 1));      // other size
++        CHECK(!c.Lookup(0x1234567, levels[0].tag, out.data(), out.size()));              // unknown key
++        CHECK(c.GetStats().entries == levels.size());
++    }
++    {   // a new run (new instance) finds everything again
++        EtcDiskCache c;
++        c.Open(d, 64u << 20);
++        bool all = true;
++        for (auto& l : levels) {
++            std::vector<uint8_t> out(l.data.size());
++            all = all && c.Lookup(l.key, l.tag, out.data(), out.size()) && out == l.data;
++        }
++        CHECK(all);
++        // storing the same level again does not grow the files
++        const uint64_t before = c.GetStats().data_bytes;
++        for (auto& l : levels) c.Store(l.key, l.tag, l.data.data(), l.data.size());
++        c.Flush();
++        CHECK(c.GetStats().data_bytes == before);
++    }
++    {   // a flipped byte in the data file is a miss, not a wrong texture
++        FILE* f = fopen((d + "/etc2_cache.dat").c_str(), "r+b");
++        CHECK(f != nullptr);
++        if (f) {
++            fseek(f, 3, SEEK_SET);   // inside the first stored level
++            int b = fgetc(f);
++            fseek(f, 3, SEEK_SET);
++            fputc(b ^ 0xff, f);
++            fclose(f);
++        }
++        EtcDiskCache c;
++        c.Open(d, 64u << 20);
++        std::vector<uint8_t> out(levels[0].data.size());
++        CHECK(!c.Lookup(levels[0].key, levels[0].tag, out.data(), out.size()));
++        CHECK(c.GetStats().corrupt == 1);
++        std::vector<uint8_t> out1(levels[1].data.size());
++        CHECK(c.Lookup(levels[1].key, levels[1].tag, out1.data(), out1.size()) && out1 == levels[1].data);
++    }
++    {   // a half-written index entry and a data file cut short: loads what is intact
++        FILE* f = fopen((d + "/etc2_cache.idx").c_str(), "ab");
++        CHECK(f != nullptr);
++        if (f) { const char junk[17] = {1}; fwrite(junk, 1, sizeof(junk), f); fclose(f); }
++        CHECK(truncate((d + "/etc2_cache.dat").c_str(), 4000) == 0);
++        EtcDiskCache c;
++        c.Open(d, 64u << 20);
++        const auto s = c.GetStats();
++        CHECK(s.entries > 0 && s.entries < levels.size());
++        struct stat st {};
++        CHECK(stat((d + "/etc2_cache.idx").c_str(), &st) == 0 && (st.st_size - 16) % 40 == 0);
++        bool intact = true;
++        for (auto& l : levels) {   // whatever the index still lists is correct
++            std::vector<uint8_t> out(l.data.size());
++            if (c.Lookup(l.key, l.tag, out.data(), out.size())) intact = intact && out == l.data;
++        }
++        CHECK(intact);
++    }
++    {   // another codec revision: the old contents are discarded
++        FILE* f = fopen((d + "/etc2_cache.idx").c_str(), "r+b");
++        CHECK(f != nullptr);
++        if (f) { fseek(f, 8, SEEK_SET); uint32_t rev = EtcDiskCache::kCodecRevision + 1; fwrite(&rev, 4, 1, f); fclose(f); }
++        EtcDiskCache c;
++        c.Open(d, 64u << 20);
++        CHECK(c.GetStats().entries == 0 && c.GetStats().data_bytes == 0);
++    }
++    {   // size limit: levels beyond it are dropped, and what fit is still readable
++        EtcDiskCache c;
++        c.Open(d, 20000);
++        for (auto& l : levels) c.Store(l.key, l.tag, l.data.data(), l.data.size());
++        c.Flush();
++        const auto s = c.GetStats();
++        CHECK(s.data_bytes <= 20000 && s.dropped > 0 && s.entries > 0);
++    }
++    {   // several threads storing and reading at once
++        EtcDiskCache c;
++        c.Open(d + "/missing_dir", 1u << 20);   // cannot be opened: stays off, calls are harmless
++        CHECK(!c.Enabled());
++        CHECK(!c.Lookup(1, 2, nullptr, 0));
++        c.Store(1, 2, nullptr, 0);
++        EtcDiskCache c2;
++        c2.Open(d, 64u << 20);
++        std::atomic<int> bad{0};
++        std::vector<std::thread> ts;
++        for (int t = 0; t < 4; t++)
++            ts.emplace_back([&, t] {
++                for (size_t i = size_t(t); i < levels.size(); i += 4) {
++                    auto& l = levels[i];
++                    c2.Store(l.key, l.tag, l.data.data(), l.data.size());
++                    std::vector<uint8_t> out(l.data.size());
++                    if (c2.Lookup(l.key, l.tag, out.data(), out.size()) && out != l.data) bad++;
++                }
++            });
++        for (auto& t : ts) t.join();
++        c2.Flush();
++        CHECK(bad == 0);
++        for (auto& l : levels) {
++            std::vector<uint8_t> out(l.data.size());
++            CHECK(c2.Lookup(l.key, l.tag, out.data(), out.size()) && out == l.data);
++        }
++    }
++    unlink((d + "/etc2_cache.dat").c_str());
++    unlink((d + "/etc2_cache.idx").c_str());
++    rmdir(d.c_str());
++}
++
+ int main() {
+     struct T { const char* name; void (*fn)(); } tests[] = {
+         {"lz4", TestLz4},
+@@ -628,6 +768,7 @@
+         {"shader_translator", TestShaderTranslator},
+         {"block_linear", TestBlockLinear},
+         {"etc_encode", TestEtcEncode},
++        {"etc_disk_cache", TestEtcDiskCache},
+ #if defined(__aarch64__)
+         {"abi_arm64", TestAbi},
+ #endif

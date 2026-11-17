@@ -59,6 +59,9 @@ struct RuntimeConfig {
     // (4x smaller than RGBA8, but lossier: off by default).
     bool bc_etc2 = true;
     bool bc3_etc2 = false;
+    // Size limit (MB) of the on-disk cache of those conversions (cache folder, etc2_cache.dat/.idx): the next run
+    // reads converted textures back instead of encoding them again. 0 = off. Once full, new levels are not stored.
+    int etc_disk_cache_mb = 1024;
     // Diagnostics. shadow_compare: how the shadow map lookups compare (0 = the game's function as Vulkan's;
     // 1 = operands swapped; 2 = always 1 (shadowed); 3 = always 0 (lit)).
     int shadow_compare = 0;
