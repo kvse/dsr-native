@@ -44,7 +44,6 @@
 #include "hle/nvn/backend.h"
 #include "hle/video.h"
 #include "runtime/runtime.h"
-#include "runtime/cheats.h"
 
 namespace {
 constexpr const char* kTag = "android";
@@ -384,6 +383,7 @@ bool SaveSetting(const std::string& path, const std::string& key, const std::str
 
 // settings.txt beside the game folder: "key = value" lines, '#' comments. Written with defaults if missing.
 void LoadSettings(const std::string& path, dsr::RuntimeConfig* cfg) {
+    cfg->hud_full_res = true;  // on unless settings.txt says hud_full_res = 0
     FILE* f = fopen(path.c_str(), "r");
     if (!f) {
         if (FILE* w = fopen(path.c_str(), "w")) {
@@ -439,12 +439,12 @@ void LoadSettings(const std::string& path, dsr::RuntimeConfig* cfg) {
         }
     } else {
         bool have_present_mode = false, have_face_buttons = false, have_gpu_driver = false, have_bc_enabler = false;
-        bool have_touch = false, have_aspect = false;
+        bool have_touch = false, have_aspect = false, have_hud_full_res = false, have_fxaa = false;
         int settings_version = 1;
-        char line[256];
+        char line[2048];  // (skip_fs / skip_post_extra list many 16-digit hashes: a line longer than the buffer was cut)
         while (fgets(line, sizeof(line), f)) {
-            char key[64], value[64];
-            if (line[0] == '#' || sscanf(line, " %63[a-z_0-9] = %63s", key, value) != 2) continue;
+            char key[64], value[1024];
+            if (line[0] == '#' || sscanf(line, " %63[a-z_0-9] = %1023s", key, value) != 2) continue;
             const int v = atoi(value);
             if (!strcmp(key, "fps")) {  // e.g. 45: a steady cap below 60; auto: dynamic (60 / 30 / 20)
                 cfg->dynamic_fps = !strcmp(value, "auto");
@@ -452,6 +452,7 @@ void LoadSettings(const std::string& path, dsr::RuntimeConfig* cfg) {
             } else if (!strcmp(key, "min_fps")) cfg->min_fps = std::clamp(v, 15, 30);
             else if (!strcmp(key, "async_pipelines")) cfg->async_pipelines = v != 0;
             else if (!strcmp(key, "auto_capture")) cfg->auto_capture = v != 0;
+            else if (!strcmp(key, "world_capture")) cfg->world_capture = v != 0;
             else if (!strcmp(key, "profile")) cfg->profile = v != 0;
             else if (!strcmp(key, "pin_render_thread")) cfg->pin_render_thread = v != 0;
             else if (!strcmp(key, "record_thread")) cfg->record_thread = v != 0;
@@ -462,13 +463,17 @@ void LoadSettings(const std::string& path, dsr::RuntimeConfig* cfg) {
             else if (!strcmp(key, "shader_depth_test")) cfg->shader_depth_test = v != 0;
             else if (!strcmp(key, "hole_test")) cfg->hole_test = v;
             else if (!strcmp(key, "hud_box")) cfg->hud_box = v != 0;
+            else if (!strcmp(key, "hud_full_res")) {
+                cfg->hud_full_res = v != 0;
+                have_hud_full_res = true;
+            }
             else if (!strcmp(key, "compositor_scaling")) cfg->compositor_scaling = v != 0;
             else if (!strcmp(key, "max_anisotropy")) cfg->max_anisotropy = v;
             else if (!strcmp(key, "shadow_compare")) cfg->shadow_compare = std::clamp(v, 0, 3);
             else if (!strcmp(key, "game_hooks")) cfg->game_hooks = v != 0;
             else if (!strcmp(key, "skip_intro")) cfg->skip_intro = v != 0;
             else if (!strcmp(key, "render_pass_objects")) cfg->render_pass_objects = v != 0;
-            else if (!strcmp(key, "render_scale")) cfg->render_scale = std::clamp(float(atof(value)), 0.5f, 1.0f);
+            else if (!strcmp(key, "render_scale")) cfg->render_scale = std::clamp(float(atof(value)), 0.30f, 1.0f);
             else if (!strcmp(key, "language")) {
                 // The game's languages (nn::settings codes it recognises); the settings menu lists the same.
                 static const char* const kLanguages[] = {"en-US", "fr", "de", "it", "es", "pt", "ru", "ja", "ko",
@@ -480,6 +485,9 @@ void LoadSettings(const std::string& path, dsr::RuntimeConfig* cfg) {
             }
             else if (!strcmp(key, "bc_etc2")) cfg->bc_etc2 = v != 0;
             else if (!strcmp(key, "bc3_etc2")) cfg->bc3_etc2 = v != 0;
+            else if (!strcmp(key, "bc_astc")) cfg->bc_astc = v != 0;
+            else if (!strcmp(key, "astc_block")) cfg->astc_block = (v == 6 || v == 8) ? v : 4;
+            else if (!strcmp(key, "bc5_astc")) cfg->bc5_astc = v != 0;
             else if (!strcmp(key, "aspect_ratio")) {
                 cfg->aspect_ratio = value;
                 have_aspect = true;
@@ -522,7 +530,25 @@ void LoadSettings(const std::string& path, dsr::RuntimeConfig* cfg) {
             } else if (!strcmp(key, "settings_version")) settings_version = v;
             else if (!strcmp(key, "mali_barriers")) cfg->mali_barriers = v != 0;
             else if (!strcmp(key, "performance_mode")) cfg->performance_mode = v != 0;
+            else if (!strcmp(key, "shadow_quality")) cfg->shadow_quality = std::clamp(v, 0, 3);
+            else if (!strcmp(key, "low_effects")) cfg->low_effects = v != 0;
             else if (!strcmp(key, "texture_mip_skip")) cfg->texture_mip_skip = std::clamp(v, 0, 1);
+            else if (!strcmp(key, "scale_filter")) cfg->scale_filter = std::clamp(v, 0, 1);
+            else if (!strcmp(key, "skip_fs")) cfg->skip_fs = value;
+            else if (!strcmp(key, "skip_bloom")) cfg->skip_bloom = v != 0;
+            else if (!strcmp(key, "skip_post")) cfg->skip_post = v != 0;
+            else if (!strcmp(key, "skip_post_extra")) cfg->skip_post_extra = value;
+            else if (!strcmp(key, "skip_white")) cfg->skip_white = value;
+            else if (!strcmp(key, "skip_post_plus")) cfg->skip_post_plus = v != 0;
+            else if (!strcmp(key, "skip_hidden")) cfg->skip_hidden = std::clamp(v, 0, 3);
+            else if (!strcmp(key, "skip_prepass")) cfg->skip_prepass = v != 0;
+            else if (!strcmp(key, "upscaler")) cfg->upscaler = std::clamp(v, 0, 2);
+            else if (!strcmp(key, "fsr_sharpness")) cfg->fsr_sharpness = std::clamp(v, 0, 100);
+            else if (!strcmp(key, "fxaa")) {
+                cfg->fxaa = std::clamp(v, 0, 2);
+                have_fxaa = true;
+            }
+            else if (!strcmp(key, "hud_max_height")) cfg->hud_max_height = v >= 360 ? std::min(v, 4320) : 0;
             else if (!strcmp(key, "gamma")) {
                 const float g = float(atof(value));
                 cfg->gamma = g >= 0.5f && g <= 3.0f ? g : 1.0f;
@@ -581,6 +607,25 @@ void LoadSettings(const std::string& path, dsr::RuntimeConfig* cfg) {
                 fclose(w);
                 LOGI(kTag, "settings: added the touch controls settings to %s", path.c_str());
             }
+        if (!have_fxaa)
+            if (FILE* w = fopen(path.c_str(), "a")) {
+                fputs("\n# fxaa: 0 = off, 1 = FXAA 3.11 fast (light: for Mali GPUs), 2 = FXAA 3.11 quality. Smooths the 3D picture's\n"
+                      "# edges at the game's render size, before it is enlarged. Needs hud_full_res = 1\n"
+                      "fxaa = 0\n"
+                      "# hud_max_height: 0 = the picture and HUD at the screen's size; 720 / 540 = at most that many lines tall,\n"
+                      "# stretched to the screen by Android (fewer pixels for FSR and the HUD on a weak GPU such as a Mali-G57)\n"
+                      "hud_max_height = 0\n", w);
+                fclose(w);
+                LOGI(kTag, "settings: added fxaa and hud_max_height to %s", path.c_str());
+            }
+        if (!have_hud_full_res)
+            if (FILE* w = fopen(path.c_str(), "a")) {
+                fputs("\n# hud_full_res: 1 = the game's HUD, menus and text are drawn at the screen's full resolution\n"
+                      "# (sharp text at any render_scale); 0 = drawn in the game's own (smaller) frame\n"
+                      "hud_full_res = 1\n", w);
+                fclose(w);
+                LOGI(kTag, "settings: added hud_full_res to %s", path.c_str());
+            }
         if (!have_gpu_driver)
             if (FILE* w = fopen(path.c_str(), "a")) {
                 fputs("\n" GPU_DRIVER_HELP "gpu_driver = system\n", w);
@@ -606,6 +651,17 @@ void LoadSettings(const std::string& path, dsr::RuntimeConfig* cfg) {
     if (!g_custom_game_dir.empty()) LOGI(kTag, "settings: game_dir %s", g_custom_game_dir.c_str());
     LOGI(kTag, "settings: touch controls %s, opacity %.2f, camera speed %.2f%s", g_touch.enabled ? "on" : "off",
          g_touch.opacity, g_touch.camera_speed, g_touch.camera_invert ? ", camera inverted" : "");
+    LOGI(kTag, "settings: hud_full_res %d, shadow_quality %d, low_effects %d, skip_hidden %d, skip_prepass %d",
+         int(cfg->hud_full_res), cfg->shadow_quality, int(cfg->low_effects), int(cfg->skip_hidden),
+         int(cfg->skip_prepass));
+    LOGI(kTag, "settings: astc_block %d, bc_astc %d, bc5_astc %d, bc3_etc2 %d, skip_bloom %d, fxaa %d, upscaler %d, fsr_sharpness %d, "
+         "hud_max_height %d, max_anisotropy %d, fps %d%s",
+         cfg->astc_block, int(cfg->bc_astc), int(cfg->bc5_astc), int(cfg->bc3_etc2), int(cfg->skip_bloom), cfg->fxaa,
+         cfg->upscaler, cfg->fsr_sharpness, cfg->hud_max_height, cfg->max_anisotropy, cfg->target_fps, cfg->dynamic_fps ? " (auto)" : "");
+    if (cfg->skip_post) LOGI(kTag, "settings: skip_post on");
+    if (cfg->skip_post_plus) LOGI(kTag, "settings: skip_post_plus on");
+    if (!cfg->skip_post_extra.empty()) LOGI(kTag, "settings: skip_post_extra %s", cfg->skip_post_extra.c_str());
+    if (!cfg->skip_white.empty()) LOGI(kTag, "settings: skip_white %s", cfg->skip_white.c_str());
     if (!cfg->shader_depth_test) LOGI(kTag, "settings: shader_depth_test off");
     if (cfg->hole_test || cfg->lrz_workaround)
         LOGI(kTag, "settings: hole_test %d, lrz_workaround %d", cfg->hole_test, int(cfg->lrz_workaround));
@@ -989,6 +1045,34 @@ jboolean JNICALL MenuApply(JNIEnv* env, jclass, jstring jkey, jstring jvalue) {
     } else if (key == "touch_camera_speed") {
         g_touch.camera_speed = std::clamp(float(atof(value.c_str())), 0.1f, 10.0f);
         now = true;
+    } else if (key == "scale_filter") {  // read by the presenter every frame
+        c.scale_filter = std::clamp(atoi(value.c_str()), 0, 1);
+        now = true;
+    } else if (key == "upscaler") {  // read when the HUD image is started, every frame
+        c.upscaler = std::clamp(atoi(value.c_str()), 0, 2);
+        now = true;
+    } else if (key == "fsr_sharpness") {
+        c.fsr_sharpness = std::clamp(atoi(value.c_str()), 0, 100);
+        now = true;
+    } else if (key == "fxaa") {  // read when the HUD image is started, every frame
+        c.fxaa = std::clamp(atoi(value.c_str()), 0, 2);
+        now = true;
+    } else if (key == "hud_max_height") {  // read with the HUD image's size, every frame
+        const int v = atoi(value.c_str());
+        c.hud_max_height = v >= 360 ? std::min(v, 4320) : 0;
+        now = true;
+    } else if (key == "skip_hidden") {  // read by every draw
+        c.skip_hidden = std::clamp(atoi(value.c_str()), 0, 3);
+        now = true;
+    } else if (key == "skip_prepass") {  // read by every draw
+        c.skip_prepass = atoi(value.c_str()) != 0;
+        now = true;
+    } else if (key == "hud_full_res") {  // read by the presenter every frame
+        c.hud_full_res = atoi(value.c_str()) != 0;
+        now = true;
+    } else if (key == "min_fps") {  // the lowest rate fps = auto may use; read by the limiter every frame
+        c.min_fps = std::clamp(atoi(value.c_str()), 15, 30);
+        now = true;
     } else if (key == "exposure") {
         const float e = float(atof(value.c_str()));
         if (e >= 0.25f && e <= 4.0f) {
@@ -1019,35 +1103,6 @@ void JNICALL MenuOpen(JNIEnv*, jclass, jboolean open) {
 jlong JNICALL MenuFrames(JNIEnv*, jclass) { return jlong(dsr::platform::FramesShown()); }
 // 1: the GPU samples BC textures itself, 0: it does not (converted on the CPU), -1: not known yet.
 jint JNICALL MenuGpuHasBc(JNIEnv*, jclass) { return jint(dsr::GpuHasBc()); }
-
-// Cheats tab (runtime/cheats.h). Text crosses as UTF-8 bytes (names in cheat files need not be valid modified UTF-8).
-jbyteArray Bytes(JNIEnv* env, const std::string& s) {
-    jbyteArray a = env->NewByteArray(jsize(s.size()));
-    if (a) env->SetByteArrayRegion(a, 0, jsize(s.size()), reinterpret_cast<const jbyte*>(s.data()));
-    return a;
-}
-std::string FromBytes(JNIEnv* env, jbyteArray a) {
-    if (!a) return std::string();
-    std::string s(size_t(env->GetArrayLength(a)), '\0');
-    env->GetByteArrayRegion(a, 0, jsize(s.size()), reinterpret_cast<jbyte*>(s.data()));
-    return s;
-}
-jbyteArray JNICALL CheatList(JNIEnv* env, jclass) { return Bytes(env, dsr::cheats::List()); }
-jboolean JNICALL CheatSet(JNIEnv*, jclass, jint i, jboolean on) {
-    return i >= 0 && dsr::cheats::SetEnabled(size_t(i), on) ? JNI_TRUE : JNI_FALSE;
-}
-jbyteArray JNICALL CheatAdd(JNIEnv* env, jclass, jbyteArray text) {
-    return Bytes(env, dsr::cheats::Add(FromBytes(env, text)));
-}
-jbyteArray JNICALL CheatCheck(JNIEnv* env, jclass, jbyteArray text) {
-    return Bytes(env, dsr::cheats::Check(FromBytes(env, text)));
-}
-jboolean JNICALL CheatDelete(JNIEnv*, jclass, jint i) {
-    return i >= 0 && dsr::cheats::Remove(size_t(i)) ? JNI_TRUE : JNI_FALSE;
-}
-jbyteArray JNICALL CheatText(JNIEnv* env, jclass, jint i) {
-    return Bytes(env, i >= 0 ? dsr::cheats::Text(size_t(i)) : std::string());
-}
 
 jclass g_menu_cls = nullptr;  // global ref
 
@@ -1113,14 +1168,8 @@ void StartSettingsMenu(android_app* app, const std::string& base, const dsr::Run
         {const_cast<char*>("nativeMenuOpen"), const_cast<char*>("(Z)V"), reinterpret_cast<void*>(&MenuOpen)},
         {const_cast<char*>("nativeFrames"), const_cast<char*>("()J"), reinterpret_cast<void*>(&MenuFrames)},
         {const_cast<char*>("nativeGpuHasBc"), const_cast<char*>("()I"), reinterpret_cast<void*>(&MenuGpuHasBc)},
-        {const_cast<char*>("nativeCheats"), const_cast<char*>("()[B"), reinterpret_cast<void*>(&CheatList)},
-        {const_cast<char*>("nativeCheatSet"), const_cast<char*>("(IZ)Z"), reinterpret_cast<void*>(&CheatSet)},
-        {const_cast<char*>("nativeCheatAdd"), const_cast<char*>("([B)[B"), reinterpret_cast<void*>(&CheatAdd)},
-        {const_cast<char*>("nativeCheatCheck"), const_cast<char*>("([B)[B"), reinterpret_cast<void*>(&CheatCheck)},
-        {const_cast<char*>("nativeCheatDelete"), const_cast<char*>("(I)Z"), reinterpret_cast<void*>(&CheatDelete)},
-        {const_cast<char*>("nativeCheatText"), const_cast<char*>("(I)[B"), reinterpret_cast<void*>(&CheatText)},
     };
-    if (env->RegisterNatives(cls, methods, int(std::size(methods))) != JNI_OK || env->ExceptionCheck()) {
+    if (env->RegisterNatives(cls, methods, 4) != JNI_OK || env->ExceptionCheck()) {
         env->ExceptionClear();
         LOGW(kTag, "settings menu: could not register natives");
         return;
@@ -1256,14 +1305,12 @@ void StartGame(android_app* app) {
         cfg.game_dir = st.base + "/game";
         cfg.save_dir = st.base + "/save";
         cfg.cache_dir = st.base + "/cache";
-        cfg.cheats_dir = st.base + "/cheats";
         // On a first launch the app's own folder may not exist yet (Android creates it lazily), and then nothing
         // below could be written. Create it and everything the user is expected to find in it.
         MakeDirs(st.base);
         mkdir(cfg.game_dir.c_str(), 0775);
         mkdir(cfg.save_dir.c_str(), 0775);
         mkdir(cfg.cache_dir.c_str(), 0775);
-        mkdir(cfg.cheats_dir.c_str(), 0775);
         LoadSettings(st.base + "/settings.txt", &cfg);
         if (app->window) {
             const int ww = ANativeWindow_getWidth(app->window), wh = ANativeWindow_getHeight(app->window);

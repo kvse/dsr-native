@@ -21,6 +21,7 @@
 #include "loader/sha256.h"
 
 static int g_failures = 0;
+#include "hle/nvn/astc_encode.h"
 #include "hle/nvn/etc_encode.h"
 #include "hle/nvn/parallel.h"
 #include "runtime/cheat_vm.h"
@@ -618,6 +619,128 @@ static void TestEtcEncode() {
     CHECK(once);
 }
 
+// BC -> ASTC 4x4 re-encoding (settings bc_astc): the blocks decode back close to the source, BC1-style palettes (four
+// colours on a line, 1/3 steps) almost exactly, and cut-out alpha keeps its shape.
+static void TestAstcEncode() {
+    using namespace dsr::hle::nvn;
+    CHECK(IsAstcEncodable(65) && IsAstcEncodable(72) && !IsAstcEncodable(73) && !IsAstcEncodable(77));
+    CHECK(AstcLevelBytes(37, 29, 1) == size_t(10) * 8 * 16 && AstcLevelBytes(1, 1, 1) == 16);
+    const int W = 37, H = 29;  // edges not on block boundaries
+    uint32_t seed = 11;
+    auto rnd = [&] { return (seed = seed * 1103515245u + 12345u) >> 16; };
+    // A BC1-like picture: every block has two colours (565-expanded) and texels at 0, 1/3, 2/3, 1 between them.
+    std::vector<uint8_t> pal(size_t(W) * H * 4);
+    for (int by = 0; by < (H + 3) / 4; by++)
+        for (int bx = 0; bx < (W + 3) / 4; bx++) {
+            int c0[3], c1[3];
+            for (int c = 0; c < 3; c++) {
+                const int a = int(rnd() & 31), b = int(rnd() & 31);
+                c0[c] = a << 3 | a >> 2;
+                c1[c] = b << 3 | b >> 2;
+            }
+            for (int y = 0; y < 4; y++)
+                for (int x = 0; x < 4; x++) {
+                    const int px = bx * 4 + x, py = by * 4 + y, i = int(rnd() & 3);
+                    if (px >= W || py >= H) continue;
+                    uint8_t* p = &pal[(size_t(py) * W + px) * 4];
+                    for (int c = 0; c < 3; c++)
+                        p[c] = uint8_t(i == 0 ? c0[c] : i == 3 ? c1[c] : i == 1 ? (2 * c0[c] + c1[c]) / 3 : (c0[c] + 2 * c1[c]) / 3);
+                    p[3] = 255;
+                }
+        }
+    // A smooth picture (as most art is) with a cut-out: texels of alpha 0 (black, as BC1 decodes them) in a pattern.
+    std::vector<uint8_t> cut(size_t(W) * H * 4);
+    for (int y = 0; y < H; y++)
+        for (int x = 0; x < W; x++) {
+            uint8_t* p = &cut[(size_t(y) * W + x) * 4];
+            const bool hole = (x / 3 + y / 5) % 3 == 0;
+            p[0] = hole ? 0 : uint8_t(x * 6 + rnd() % 9);
+            p[1] = hole ? 0 : uint8_t(y * 8 + rnd() % 9);
+            p[2] = hole ? 0 : uint8_t(((x ^ y) & 8) ? 220 : 30);
+            p[3] = hole ? 0 : 255;
+        }
+    for (int mode = 0; mode < 2; mode++) {
+        const std::vector<uint8_t>& img = mode ? cut : pal;
+        const int bxn = (W + 3) / 4, byn = (H + 3) / 4;
+        std::vector<uint8_t> out(AstcLevelBytes(W, H, 1));
+        EncodeAstc4x4(out.data(), img.data(), W, H, 1);
+        double se = 0;
+        long n = 0;
+        int alpha_wrong = 0;
+        bool understood = true;
+        for (int by = 0; by < byn; by++)
+            for (int bx = 0; bx < bxn; bx++) {
+                uint8_t d[16][4];
+                understood = understood && DecodeAstc4x4Block(&out[(size_t(by) * bxn + bx) * 16], d);
+                for (int y = 0; y < 4; y++)
+                    for (int x = 0; x < 4; x++) {
+                        const int sx = bx * 4 + x, sy = by * 4 + y;
+                        if (sx >= W || sy >= H) continue;
+                        const uint8_t* p = &img[(size_t(sy) * W + sx) * 4];
+                        const uint8_t* q = d[y * 4 + x];
+                        if ((p[3] >= 128) != (q[3] >= 128)) alpha_wrong++;
+                        if (p[3] >= 128)
+                            for (int c = 0; c < 3; c++) {
+                                const double e = double(q[c]) - p[c];
+                                se += e * e;
+                                n++;
+                            }
+                    }
+            }
+        CHECK(understood);
+        CHECK(alpha_wrong == 0);
+        CHECK(n > 0 && se / n < (mode ? 40.0 * 40.0 / 4 : 4.0 * 4.0));  // palettes: PSNR ~36 dB; noisy cut-out picture: ~28 dB
+    }
+}
+
+// ASTC 6x6 / 8x8 and BC5 as luminance + alpha (settings astc_block, bc5_astc): every block is one this file's decoder
+// understands, sizes are as many bytes as 16 per block, and the pictures come back close to the source.
+static void TestAstcBlockSizes() {
+    using namespace dsr::hle::nvn;
+    CHECK(AstcBlockDim(6) == 6 && AstcBlockDim(8) == 8 && AstcBlockDim(5) == 4 && AstcBlockDim(0) == 4);
+    CHECK(AstcLevelBytes(37, 29, 1, 6) == size_t(7) * 5 * 16 && AstcLevelBytes(37, 29, 1, 8) == size_t(5) * 4 * 16);
+    CHECK(IsAstcLaEncodable(75) && !IsAstcLaEncodable(76) && !IsAstcLaEncodable(73));
+    const int W = 61, H = 45;
+    std::vector<uint8_t> rgba(size_t(W) * H * 4), rg(size_t(W) * H * 2);
+    for (int y = 0; y < H; y++)
+        for (int x = 0; x < W; x++) {
+            uint8_t* p = &rgba[(size_t(y) * W + x) * 4];
+            p[0] = uint8_t(x * 4);
+            p[1] = uint8_t(y * 5);
+            p[2] = uint8_t(100 + ((x + y) & 7));
+            p[3] = 255;
+            rg[(size_t(y) * W + x) * 2] = uint8_t(128 + 100 * std::sin(x * 0.2) * std::cos(y * 0.15));
+            rg[(size_t(y) * W + x) * 2 + 1] = uint8_t(128 + 100 * std::cos(x * 0.1 + y * 0.12));
+        }
+    for (int bw : {4, 6, 8}) {
+        const int bxn = (W + bw - 1) / bw, byn = (H + bw - 1) / bw;
+        for (int la = 0; la < 2; la++) {
+            std::vector<uint8_t> out(AstcLevelBytes(W, H, 1, bw));
+            if (la) EncodeAstcLA(out.data(), rg.data(), W, H, 1, bw);
+            else EncodeAstc(out.data(), rgba.data(), W, H, 1, bw);
+            double se = 0, n = 0;
+            bool understood = true;
+            for (int by = 0; by < byn; by++)
+                for (int bx = 0; bx < bxn; bx++) {
+                    uint8_t d[64][4];
+                    understood = understood && DecodeAstcBlock(&out[(size_t(by) * bxn + bx) * 16], bw, d);
+                    for (int y = 0; y < bw; y++)
+                        for (int x = 0; x < bw; x++) {
+                            const int sx = bx * bw + x, sy = by * bw + y;
+                            if (sx >= W || sy >= H) continue;
+                            for (int c = 0; c < (la ? 2 : 3); c++) {
+                                const double e = double(d[y * bw + x][la ? (c ? 3 : 0) : c]) - (la ? rg[(size_t(sy) * W + sx) * 2 + c] : rgba[(size_t(sy) * W + sx) * 4 + c]);
+                                se += e * e;
+                                n++;
+                            }
+                        }
+                }
+            CHECK(understood);
+            CHECK(n > 0 && se / n < 20.0 * 20.0);  // smooth pictures: well above 22 dB even in 8x8 blocks
+        }
+    }
+}
+
 // Cheat codes (Atmosphère format): parsing and the machine, on a fake memory with main at 0x1000 and the heap at
 // 0x100000.
 namespace {
@@ -740,6 +863,8 @@ int main() {
         {"shader_translator", TestShaderTranslator},
         {"block_linear", TestBlockLinear},
         {"etc_encode", TestEtcEncode},
+        {"astc_encode", TestAstcEncode},
+        {"astc_block_sizes", TestAstcBlockSizes},
         {"cheats", TestCheats},
 #if defined(__aarch64__)
         {"abi_arm64", TestAbi},

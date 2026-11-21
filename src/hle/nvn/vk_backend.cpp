@@ -24,7 +24,10 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <chrono>
+#include <cstdio>
 #include <cstring>
+#include <type_traits>
 #include <memory>
 #include <thread>
 #include <deque>
@@ -45,18 +48,27 @@
 #include "common/profiler.h"
 #include "common/platform.h"
 #include "hle/nvn/backend.h"
+#include "hle/nvn/astc_encode.h"
 #include "hle/nvn/bc_decode.h"
 #include "hle/nvn/etc_encode.h"
 #include "hle/nvn/parallel.h"
+#include <condition_variable>
+#include <deque>
+#include <mutex>
+#include <thread>
 #include "runtime/runtime.h"
 #include "hle/nvn/layout.h"
 #include "hle/os/os.h"
 #include "hle/nvn/shader/translator.h"
 #include "hle/nvn/state.h"
 #include "hle/video.h"
+#include "hle/nvn/postfx_spv.h"
 
 namespace dsr::hle::nvn {
 #include "hle/nvn/vk_dispatch.h"
+#ifdef DSR_HAVE_FSR1
+#include "fsr1_spv.h"  // generated at build time from src/hle/nvn/shaders (cmake/build_fsr1_spv.cmake)
+#endif
 namespace {
 constexpr const char* kTag = "vulkan";
 
@@ -151,6 +163,12 @@ VkFormat SrgbTwin(VkFormat f) {
         case VK_FORMAT_ETC2_R8G8B8A1_SRGB_BLOCK: return VK_FORMAT_ETC2_R8G8B8A1_UNORM_BLOCK;
         case VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK: return VK_FORMAT_ETC2_R8G8B8A8_SRGB_BLOCK;
         case VK_FORMAT_ETC2_R8G8B8A8_SRGB_BLOCK: return VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK;
+        case VK_FORMAT_ASTC_4x4_UNORM_BLOCK: return VK_FORMAT_ASTC_4x4_SRGB_BLOCK;
+        case VK_FORMAT_ASTC_4x4_SRGB_BLOCK: return VK_FORMAT_ASTC_4x4_UNORM_BLOCK;
+        case VK_FORMAT_ASTC_6x6_UNORM_BLOCK: return VK_FORMAT_ASTC_6x6_SRGB_BLOCK;
+        case VK_FORMAT_ASTC_6x6_SRGB_BLOCK: return VK_FORMAT_ASTC_6x6_UNORM_BLOCK;
+        case VK_FORMAT_ASTC_8x8_UNORM_BLOCK: return VK_FORMAT_ASTC_8x8_SRGB_BLOCK;
+        case VK_FORMAT_ASTC_8x8_SRGB_BLOCK: return VK_FORMAT_ASTC_8x8_UNORM_BLOCK;
         default: return VK_FORMAT_UNDEFINED;
     }
 }
@@ -317,10 +335,21 @@ VkFormat BcDecodedFormat(int f) {
     }
 }
 
-// What a BC texture becomes on a GPU without BC support: decoded (RGBA8, R8, RG8, RGBA16F) or re-encoded as ETC2.
-enum class BcTo : uint8_t { Decoded, Etc2, Etc2Rgba8 };
-VkFormat ConvertedFormat(int f, BcTo to) {
+// What a BC texture becomes on a GPU without BC support: decoded (RGBA8, R8, RG8, RGBA16F) or re-encoded as ETC2 or
+// ASTC (settings bc_astc: BC1 and BC3, as RGBA; bc5_astc: BC5 as luminance + alpha; block size: astc_block).
+enum class BcTo : uint8_t { Decoded, Etc2, Etc2Rgba8, Astc, AstcLa };
+int AstcBlock() { return AstcBlockDim(dsr::GetRuntime().config.astc_block); }
+VkFormat AstcFormat(int block, bool srgb) {
+    switch (block) {
+        case 6: return srgb ? VK_FORMAT_ASTC_6x6_SRGB_BLOCK : VK_FORMAT_ASTC_6x6_UNORM_BLOCK;
+        case 8: return srgb ? VK_FORMAT_ASTC_8x8_SRGB_BLOCK : VK_FORMAT_ASTC_8x8_UNORM_BLOCK;
+        default: return srgb ? VK_FORMAT_ASTC_4x4_SRGB_BLOCK : VK_FORMAT_ASTC_4x4_UNORM_BLOCK;
+    }
+}
+VkFormat ConvertedFormat(int f, BcTo to, int astc_block = 0) {  // astc_block 0: settings astc_block
     const bool srgb = f == 69 || f == 70 || f == 71 || f == 72 || f == 78;
+    if (to == BcTo::Astc && IsAstcEncodable(f)) return AstcFormat(astc_block ? astc_block : AstcBlock(), srgb);
+    if (to == BcTo::AstcLa && IsAstcLaEncodable(f)) return AstcFormat(astc_block ? astc_block : AstcBlock(), false);
     if (to == BcTo::Etc2 && IsEtcEncodable(f)) {
         if (EtcHasPunchThrough(f)) return srgb ? VK_FORMAT_ETC2_R8G8B8A1_SRGB_BLOCK : VK_FORMAT_ETC2_R8G8B8A1_UNORM_BLOCK;
         return srgb ? VK_FORMAT_ETC2_R8G8B8_SRGB_BLOCK : VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK;
@@ -457,6 +486,8 @@ struct Image {
     VkFormatFeatureFlags features = 0;
     bool written = false;  // has the GPU (or an upload) put anything in it
     bool uploaded = false;
+    bool pending = false;  // converted on the background thread; its copy is recorded when the result is ready
+    uint64_t serial = 0;   // identifies one upload (a result for a replaced image is dropped)
     // Contents came from game memory (not rendered by the GPU): re-uploaded when the game rewrites the
     // memory. Checked via a sparse hash: after an unchanged check the next one comes twice as many command
     // lists later (up to kMaxCheckInterval); a change, or an explicit MarkTextureDirty, resets that.
@@ -487,12 +518,20 @@ struct Image {
     bool fragdepth_written = false;
     BcKind bc = BcKind::None;  // block-compressed texture converted on upload (GPU without BC support)
     BcTo bc_to = BcTo::Decoded;  // ... into what
+    int astc_block = 4;          // ... block size when that is ASTC (settings astc_block, 4 for small / UI textures)
     bool storage = false;      // created with VK_IMAGE_USAGE_STORAGE_BIT
     bool mutable_fmt = false;  // created with VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT (views in `twin` allowed)
     uint64_t attach_gen = 0;  // times attached to a render pass (`hole_test` 16 copies)
     VkClearValue clear_value{};
     VkImageAspectFlags clear_aspect = 0;
     int clear_layer = 0, clear_level = 0;
+    // Changes whenever this depth image is cleared or drawn into (value of a global counter, so never repeated): a
+    // snapshot of it (DepthSnapshot) is current while this is what it was taken at. A global counter made a clear or
+    // a depth write in ANY other depth buffer (the 196x90 and 392x180 ones) throw the world's snapshot away, and each
+    // new snapshot ends the open pass.
+    uint64_t content_gen = 0;
+    bool skip_zeroed = false;  // settings skip_fs: a skipped pass's target, cleared to zero (until a draw writes it)
+    bool skip_fill_white = false;  // settings skip_white: ... cleared to white (1.0) instead of zero (valid with skip_zeroed)
 };
 
 struct Shader {
@@ -533,6 +572,9 @@ struct DrawState {
 
 class VulkanBackend final : public Backend {
 public:
+    ~VulkanBackend() { StopBcThread(); }
+private:
+public:
     const char* Name() const override { return "vulkan"; }
 
     struct MsTimer {
@@ -561,6 +603,7 @@ public:
                         Begin();
                         const int layer = st_.rts[c.index].layer, level = st_.rts[c.index].level;
                         if (!IsDepthFormat(img->nvn_format) && !capture_active_) {
+                            img->skip_zeroed = false;  // the game writes it: no longer the skipped pass's zero
                             VkClearValue v{};
                             memcpy(v.color.uint32, c.color, sizeof(v.color.uint32));
                             if (rendering_ && size_t(c.index) < pass_color_count_ && pass_colors_[c.index] == img &&
@@ -572,7 +615,8 @@ public:
                                 clears_in_pass_++;
                             } else {
                                 if (InOpenPass(img)) EndRendering();  // draws after the clear must see it
-                                if (img->clear_pending) FlushClear(*img);
+                                if (img->clear_pending && !DeadClear(*img, VK_IMAGE_ASPECT_COLOR_BIT, layer, level))
+                                    FlushClear(*img);
                                 img->clear_pending = true;
                                 img->clear_value = v;
                                 img->clear_aspect = VK_IMAGE_ASPECT_COLOR_BIT;
@@ -602,6 +646,16 @@ public:
                     Image* src = GetImage(c.copy->src, true);  // a CPU-written source (video frames) is refreshed
                     Image* dst = GetImage(c.copy->dst, false);
                     if (!src || !dst || src == dst) break;
+                    {
+                        // Whether the copy touches the open pass's attachments: a copy of two images the pass does not
+                        // use could wait for the pass to end; one of its own targets cannot.
+                        char k[144];
+                        snprintf(k, sizeof(k), "fmt %d %dx%d -> fmt %d %dx%d%s%s%s", src->nvn_format, src->width,
+                                 src->height, dst->nvn_format, dst->width, dst->height,
+                                 !rendering_ ? " (no pass open)" : "", InOpenPass(src) ? " (src is a target of the pass)" : "",
+                                 InOpenPass(dst) ? " (dst is a target of the pass)" : "");
+                        copy_counts_[k]++;
+                    }
                     Begin();
                     EndRendering();
                     CopyImage(*src, c.copy->src_region, *dst, c.copy->dst_region, c.flags);
@@ -937,9 +991,15 @@ public:
             capture_active_ = true;
             world_draws_logged_ = 0;
             capture_pass_ = 0;
+            pass_infos_.clear();
+            pass_fs_first_ = 0;
+            pass_distinct_fs_ = 0;
+            pass_target_.clear();
             pass_written_.clear();
             pass_draws_ = 0;
             query_pass_.clear();
+            query_fs_.clear();
+            query_verts_.clear();
             capture_draws_logged_ = 0;
             geo_dumps_ = 0;
             map_geo_dumps_ = 0;
@@ -958,9 +1018,11 @@ public:
             LOGI(kTag, "frame capture (requested): recording this frame's passes");
             return;
         }
-        if (captures_done_ >= 6 || !dsr::GetRuntime().config.auto_capture) return;
+        const RuntimeConfig& cc = dsr::GetRuntime().config;
+        if (captures_done_ >= 6 || (!cc.auto_capture && !cc.world_capture)) return;
+        if (!cc.auto_capture && captures_done_ >= 3) return;  // world_capture: three are enough
         if (!capture_clock_started_) {
-            if (last_list_draws_ < 100) return;  // wait for real 3D frames
+            if (last_list_draws_ < (cc.auto_capture ? 100u : 300u)) return;  // wait for real 3D frames
             capture_clock_started_ = true;
             next_capture_ = now + std::chrono::seconds(15);
             return;
@@ -970,6 +1032,10 @@ public:
         capture_active_ = true;
         world_draws_logged_ = 0;
         capture_pass_ = 0;
+        pass_infos_.clear();
+        pass_fs_first_ = 0;
+        pass_distinct_fs_ = 0;
+        pass_target_.clear();
         if (!query_pool_) {
             VkQueryPoolCreateInfo qi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
             qi.queryType = VK_QUERY_TYPE_OCCLUSION;
@@ -982,6 +1048,8 @@ public:
             vkCmdResetQueryPool(SyncCmd(), query_pool_, 0, kMaxQueries);
         }
         query_pass_.clear();
+        query_fs_.clear();
+        query_verts_.clear();
         StartPassTimestamps();
         pass_written_.clear();
         pass_draws_ = 0;
@@ -1015,6 +1083,19 @@ public:
     }
     void CaptureEndOfPass() {
         WriteTimestamp();
+        {
+            PassInfo pi;
+            pi.pass = capture_pass_;
+            pi.draws = pass_draws_;
+            pi.fs_first = pass_fs_first_;
+            pi.fs_last = pass_fs_hash_;
+            pi.distinct_fs = pass_distinct_fs_;
+            pi.target = pass_target_.empty() ? "-" : pass_target_;
+            pass_infos_.push_back(pi);
+            pass_fs_first_ = 0;
+            pass_distinct_fs_ = 0;
+            pass_target_.clear();
+        }
         if (!pass_written_.empty())
             LOGI(kTag, "capture pass %u: %u draws, last fs %016llx (code @%llx, vs @%llx), last textures:%s", capture_pass_,
                  pass_draws_, (unsigned long long)pass_fs_hash_, (unsigned long long)pass_fs_addr_,
@@ -1166,17 +1247,37 @@ public:
                 const double ns = props_.limits.timestampPeriod;
                 std::string line;
                 double total = 0;
+                std::map<uint32_t, double> pass_ms;
                 for (uint32_t i = 1; i < ts_count_; i++) {
                     const double ms = double(ts[i] - ts[i - 1]) * ns / 1e6;
                     total += ms;
+                    pass_ms[ts_pass_[i]] += ms;
                     if (ms < 0.05) continue;
                     char d[48];
                     snprintf(d, sizeof(d), " p%u:%.2f", ts_pass_[i], ms);
                     line += d;
                 }
                 LOGI(kTag, "capture %d GPU ms per pass (total %.1f ms):%s", captures_done_ + 1, total, line.c_str());
+                // The same, one line per pass, slowest first: target, draws, fragment programs (first .. last).
+                std::vector<std::pair<double, size_t>> order;
+                for (size_t k = 0; k < pass_infos_.size(); k++) order.push_back({pass_ms[pass_infos_[k].pass], k});
+                std::sort(order.begin(), order.end(), [](auto& a, auto& b) { return a.first > b.first; });
+                LOGI(kTag, "capture %d pass table: %zu passes, %.1f ms of GPU time, slowest first (pass: ms, share | target | draws | "
+                     "fragment programs first..last, how many different)", captures_done_ + 1, pass_infos_.size(), total);
+                double shown = 0;
+                for (size_t r = 0; r < order.size() && r < 40; r++) {
+                    const PassInfo& pi = pass_infos_[order[r].second];
+                    shown += order[r].first;
+                    LOGI(kTag, "capture %d pass table: p%u: %.2f ms, %.0f%% | %s | %u draws | fs %016llx..%016llx (%u)",
+                         captures_done_ + 1, pi.pass, order[r].first, total > 0 ? 100.0 * order[r].first / total : 0.0,
+                         pi.target.c_str(), pi.draws, (unsigned long long)pi.fs_first, (unsigned long long)pi.fs_last,
+                         pi.distinct_fs);
+                }
+                if (order.size() > 40) LOGI(kTag, "capture %d pass table: %zu more passes, %.1f ms together", captures_done_ + 1,
+                                            order.size() - 40, total - shown);
             }
         }
+        pass_infos_.clear();
         captures_done_++;
         if (query_pool_ && !query_pass_.empty()) {
             std::vector<uint64_t> res(query_pass_.size());
@@ -1194,6 +1295,50 @@ public:
                     line += d;
                 }
                 LOGI(kTag, "capture %d samples passed per pass (samples/draws):%s", captures_done_, line.c_str());
+                // Per fragment program over the passes of more than 4 draws (the world): pixels shaded (a tiling GPU
+                // runs fragment work when the pass ends, so per-draw timestamps are meaningless; pixels x shader cost is
+                // what counts), draws and vertices. A program near the top of both lists is the one to look at.
+                {
+                    struct Agg { uint64_t px = 0, verts = 0; uint32_t draws = 0, zero = 0; };
+                    std::map<uint64_t, Agg> by_fs;
+                    uint64_t total_px = 0, total_verts = 0;
+                    for (size_t q = 0; q < res.size() && q < query_fs_.size(); q++) {
+                        if (per_pass[query_pass_[q]].second <= 4) continue;
+                        Agg& g = by_fs[query_fs_[q]];
+                        g.px += res[q];
+                        g.verts += query_verts_[q];
+                        g.draws++;
+                        g.zero += res[q] == 0;
+                        total_px += res[q];
+                        total_verts += query_verts_[q];
+                    }
+                    std::vector<std::pair<uint64_t, uint64_t>> by_px, by_v;
+                    for (auto& [h, g] : by_fs) {
+                        by_px.push_back({g.px, h});
+                        by_v.push_back({g.verts, h});
+                    }
+                    std::sort(by_px.rbegin(), by_px.rend());
+                    std::sort(by_v.rbegin(), by_v.rend());
+                    LOGI(kTag, "capture %d world passes: %llu pixels shaded, %llu vertices, %zu fragment programs",
+                         captures_done_, (unsigned long long)total_px, (unsigned long long)total_verts, by_fs.size());
+                    std::string l1, l2;
+                    for (size_t i = 0; i < by_px.size() && i < 12; i++) {
+                        const Agg& g = by_fs[by_px[i].second];
+                        char d[96];
+                        snprintf(d, sizeof(d), " %016llx %.0f%% px (%u draws, %u not visible);", (unsigned long long)by_px[i].second,
+                                 total_px ? 100.0 * double(g.px) / double(total_px) : 0.0, g.draws, g.zero);
+                        l1 += d;
+                    }
+                    for (size_t i = 0; i < by_v.size() && i < 8; i++) {
+                        const Agg& g = by_fs[by_v[i].second];
+                        char d[96];
+                        snprintf(d, sizeof(d), " %016llx %.0f%% verts (%u draws);", (unsigned long long)by_v[i].second,
+                                 total_verts ? 100.0 * double(g.verts) / double(total_verts) : 0.0, g.draws);
+                        l2 += d;
+                    }
+                    LOGI(kTag, "capture %d world passes, fragment programs by pixels shaded:%s", captures_done_, l1.c_str());
+                    LOGI(kTag, "capture %d world passes, fragment programs by vertices drawn:%s", captures_done_, l2.c_str());
+                }
                 // Per draw, for passes of few draws (single objects): did it cover any pixels?
                 std::string per_draw;
                 for (size_t q = 0; q < res.size(); q++) {
@@ -1247,29 +1392,82 @@ public:
         std::lock_guard<std::mutex> lk(m_);
         if (!EnsureDevice()) return;
         ReportDraws();
+        occ_frame_++;
+        if (dsr::GetRuntime().config.skip_hidden >= 3) {
+            occ_order_prev_.swap(occ_order_);  // the draw order of the frame that has just ended
+            occ_order_.clear();
+            for (size_t i = 0; i < occ_order_prev_.size(); i++) {
+                auto it = occ_state_.find(occ_order_prev_[i]);
+                if (it != occ_state_.end()) it->second.pos = uint32_t(i);
+            }
+            PollOcclusion();
+        }
+        // Keys of draws the game no longer issues (streamed geometry gets a new address all the time) piled up until the
+        // 40000 limit emptied the whole table, and every draw then started again from "unknown" at once. Old ones go now.
+        if (occ_state_.size() > 12000 && (occ_frame_ & 127) == 0) {
+            for (auto it = occ_state_.begin(); it != occ_state_.end();) {
+                if (it->second.last_seen + 600 < occ_frame_) it = occ_state_.erase(it);
+                else ++it;
+            }
+        }
+        if (occ_seen_ >= 8) occ_moving_ = occ_moved_ * 4 > occ_seen_;  // more than a quarter of the draws moved
+        occ_still_ = occ_moving_ ? 0 : occ_still_ + 1;
+        occ_moved_ = occ_seen_ = 0;
         // The frame rate cap changed while the game runs (settings menu): tell the display.
         if (window_ && swapchain_ && window_fps_ && window_fps_ != std::clamp(dsr::GetRuntime().config.target_fps, 30, 60))
             SetWindowFrameRate();
         Image* src = tex.valid ? FindImage(tex) : nullptr;
         if (src && !(src->written && !IsDepthFormat(src->nvn_format))) src = nullptr;
-        // The swapchain is sized for the game's frame (see EnsureSwapchain): a frame of another size remakes it.
-        if (src && dsr::GetRuntime().config.compositor_scaling && (src->width != frame_w_ || src->height != frame_h_)) {
-            frame_w_ = src->width;
-            frame_h_ = src->height;
-            if (swapchain_) swapchain_dirty_ = true;
+        if (src) {
+            presented_addrs_.insert(src->addr);  // the textures the game presents: hud_full_res only redirects draws to them
+            game_frame_area_ = uint64_t(src->width) * uint64_t(src->height);  // skip_post: the 3D world is at most this big
+            HudUpdateSize(*src);
+        }
+        // The swapchain is sized for the game's frame (see EnsureSwapchain): a frame of another size remakes it. With
+        // hud_full_res it is sized for the screen-sized HUD image instead (the picture then needs no stretching).
+        if (src && (hud_w_ > 0 || dsr::GetRuntime().config.compositor_scaling)) {
+            const int tw = hud_w_ > 0 ? hud_w_ : src->width, th = hud_w_ > 0 ? hud_h_ : src->height;
+            if (tw != frame_w_ || th != frame_h_) {
+                frame_w_ = tw;
+                frame_h_ = th;
+                if (swapchain_) swapchain_dirty_ = true;
+            }
         }
         if (!EnsureSwapchain()) return;
         // Acquire, copy and present run on the recorder after this frame's commands; the render thread goes on.
         BeginCommands();
+        EnsureOverlay();
+        WarmupStep(25.0);
+        PumpBcUploads();
         PresentJob pj;
+        // hud_full_res: this frame's HUD went into hud_img_ (the enlarged 3D picture plus the HUD): show that one.
+        Image* shown = src;
         if (src) {
-            Transition(*src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-            pj.src = src->image;
-            pj.sw = src->width;
-            pj.sh = src->height;
+            if (hud_final_ && hud2_img_.image) {
+                shown = &hud2_img_;  // the final pass ran on the enlarged picture, at the screen's size
+            } else if (hud_started_ && hud_img_.image && src->addr == hud_t_addr_) {
+                shown = &hud_img_;   // the HUD frame is presented as it is
+            } else if (hud_started_ && ++hud_orphans_ >= 3) {
+                // The HUD went into the enlarged picture but nothing turned it into the presented frame: stop using it.
+                hud_sources_.erase(hud_t_addr_);
+                hud_orphans_ = 0;
+                LOGW(kTag, "hud_full_res: the HUD frame @%llx never reached the screen: not redirected any more",
+                     (unsigned long long)hud_t_addr_);
+            }
+            if (shown != src) hud_orphans_ = 0;
+        }
+        hud_started_ = false;
+        hud_final_ = false;
+        hud_cand_addr_ = 0;
+        if (shown) {
+            if (shown == &hud_img_ || shown == &hud2_img_) EndRendering();
+            Transition(*shown, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+            pj.src = shown->image;
+            pj.sw = shown->width;
+            pj.sh = shown->height;
             if (!logged_first_image_) {
                 logged_first_image_ = true;
-                LOGI(kTag, "showing the game's frame: %dx%d (format %d)", pj.sw, pj.sh, src->nvn_format);
+                LOGI(kTag, "showing the game's frame: %dx%d (format %d)", pj.sw, pj.sh, shown->nvn_format);
             }
         }
         barriers_ += 2;
@@ -1304,6 +1502,116 @@ private:
                              nullptr, 1, &b);
     }
     // Recorder: acquires a swapchain image, copies the frame into it, submits slot i and presents.
+    // ---- progress overlay, drawn by the presenter -------------------------------------------------------------
+    // Two 1x1 images, white (0) and black (1), are blitted as rectangles; a glyph pixel is one rectangle.
+    VkImage ov_img_[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+    VkDeviceMemory ov_mem_[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+    bool ov_ready_ = false, ov_failed_ = false;
+
+    void EnsureOverlay() {
+        if (ov_ready_ || ov_failed_) return;
+        for (int i = 0; i < 2; i++) {
+            VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+            ci.imageType = VK_IMAGE_TYPE_2D;
+            ci.format = VK_FORMAT_R8G8B8A8_UNORM;
+            ci.extent = {1, 1, 1};
+            ci.mipLevels = 1;
+            ci.arrayLayers = 1;
+            ci.samples = VK_SAMPLE_COUNT_1_BIT;
+            ci.tiling = VK_IMAGE_TILING_OPTIMAL;
+            ci.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+            ci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+            ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            if (vkCreateImage(device_, &ci, nullptr, &ov_img_[i]) != VK_SUCCESS) {
+                ov_failed_ = true;
+                return;
+            }
+            VkMemoryRequirements req;
+            vkGetImageMemoryRequirements(device_, ov_img_[i], &req);
+            VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+            ai.allocationSize = req.size;
+            ai.memoryTypeIndex = FindMemory(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            if (vkAllocateMemory(device_, &ai, nullptr, &ov_mem_[i]) != VK_SUCCESS) {
+                ov_failed_ = true;
+                return;
+            }
+            vkBindImageMemory(device_, ov_img_[i], ov_mem_[i], 0);
+            VkClearColorValue colour{};
+            colour.float32[0] = colour.float32[1] = colour.float32[2] = i == 0 ? 1.0f : 0.0f;
+            colour.float32[3] = 1.0f;
+            const VkImage img = ov_img_[i];
+            Rec([img, colour](VkCommandBuffer cb) {
+                const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+                VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+                b.image = img;
+                b.subresourceRange = range;
+                b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+                b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+                b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr,
+                                     0, nullptr, 1, &b);
+                vkCmdClearColorImage(cb, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &colour, 1, &range);
+                b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                b.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+                b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+                b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+                vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr,
+                                     0, nullptr, 1, &b);
+            });
+        }
+        ov_ready_ = true;
+        LOGI(kTag, "progress overlay ready");
+    }
+
+    void OverlayRect(VkCommandBuffer cb, VkImage sc, int which, int x, int y, int w, int h) {
+        const int dw = int(sc_extent_.width), dh = int(sc_extent_.height);
+        if (w <= 0 || h <= 0 || x < 0 || y < 0 || x + w > dw || y + h > dh) return;
+        VkImageBlit b{};
+        b.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        b.srcOffsets[1] = {1, 1, 1};
+        b.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        b.dstOffsets[0] = {x, y, 0};
+        b.dstOffsets[1] = {x + w, y + h, 1};
+        vkCmdBlitImage(cb, ov_img_[which], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, sc, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                       1, &b, VK_FILTER_NEAREST);
+    }
+
+    // 3x5 pixel glyphs: '#' is a lit pixel.
+    static const char* const* GlyphRows(char c) {
+        static const char* const kDigits[10][5] = {
+            {"###", "#.#", "#.#", "#.#", "###"}, {".#.", "##.", ".#.", ".#.", "###"},
+            {"###", "..#", "###", "#..", "###"}, {"###", "..#", "###", "..#", "###"},
+            {"#.#", "#.#", "###", "..#", "..#"}, {"###", "#..", "###", "..#", "###"},
+            {"###", "#..", "###", "#.#", "###"}, {"###", "..#", "..#", "..#", "..#"},
+            {"###", "#.#", "###", "#.#", "###"}, {"###", "#.#", "###", "..#", "###"}};
+        static const char* const kPct[5] = {"#.#", "..#", ".#.", "#..", "#.#"};
+        static const char* const kSpace[5] = {"...", "...", "...", "...", "..."};
+        if (c >= '0' && c <= '9') return kDigits[c - '0'];
+        if (c == '%') return kPct;
+        return kSpace;
+    }
+    void DrawGlyphText(VkCommandBuffer cb, VkImage sc, const std::string& text, int x0, int y0, int px) {
+        const int adv = 4;  // 3 columns and a gap
+        for (size_t ci = 0; ci < text.size(); ci++) {
+            const char* const* rows = GlyphRows(text[ci]);
+            for (int r = 0; r < 5; r++)
+                for (int col = 0; col < 3; col++)
+                    if (rows[r][col] == '#')
+                        OverlayRect(cb, sc, 0, x0 + int(ci) * adv * px + col * px, y0 + r * px, px, px);
+        }
+    }
+    void DrawProgressBar(VkCommandBuffer cb, VkImage sc, int permille) {
+        const int dw = int(sc_extent_.width), dh = int(sc_extent_.height);
+        const int px = std::max(3, dh / 120), bw = dw * 2 / 5, bh = px * 3;
+        const int x0 = (dw - bw) / 2, y0 = dh - bh * 4;
+        const int pct = std::min(permille, 1000) / 10;
+        DrawGlyphText(cb, sc, std::to_string(pct) + "%", x0, y0 - px * 8, px);
+        OverlayRect(cb, sc, 1, x0 - px, y0 - px, bw + 2 * px, bh + 2 * px);  // black frame
+        OverlayRect(cb, sc, 0, x0, y0, bw * std::min(permille, 1000) / 1000, bh);  // white fill
+    }
+
     void PresentSlot(int i, const PresentJob& pj) {
         uint32_t idx = 0;
         VkResult r = vkAcquireNextImageKHR(device_, swapchain_, 1000000000ull, acquire_sem_, VK_NULL_HANDLE, &idx);
@@ -1344,8 +1652,13 @@ private:
             blit.dstOffsets[0] = {x, y, 0};
             blit.dstOffsets[1] = {x + w, y + h, 1};
             vkCmdBlitImage(cmd_, pj.src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, sc, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
-                           &blit, w == pj.sw && h == pj.sh ? VK_FILTER_NEAREST : VK_FILTER_LINEAR);
+                           &blit,
+                           w == pj.sw && h == pj.sh || dsr::GetRuntime().config.scale_filter == 0
+                               ? VK_FILTER_NEAREST
+                               : VK_FILTER_LINEAR);
         }
+        const int warm = warm_permille_.load();
+        if (ov_ready_ && warm >= 0) DrawProgressBar(cmd_, sc, warm);
         CmdImageBarrier(cmd_, sc, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
         SubmitSlot(i, acquire_sem_, render_sem_);
         VkPresentInfoKHR pi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
@@ -1405,6 +1718,8 @@ private:
         LOGI(kTag, "GPU: %s, Vulkan %u.%u.%u, driver 0x%x (%u.%u)", props_.deviceName, VK_VERSION_MAJOR(props_.apiVersion),
              VK_VERSION_MINOR(props_.apiVersion), VK_VERSION_PATCH(props_.apiVersion), props_.driverVersion,
              VK_VERSION_MAJOR(props_.driverVersion), VK_VERSION_MINOR(props_.driverVersion));
+        gpu_mali_ = strstr(props_.deviceName, "Mali") != nullptr || props_.vendorID == 0x13B5;  // Arm
+        if (gpu_mali_) LOGI(kTag, "Arm Mali GPU: tile-based, no BC textures (ETC2 re-encode), pipelines ~14 KB each");
         // Qualcomm's Adreno 6xx drivers (512.x before 512.514) do not expose the BC texture formats the GPU
         // supports; BCeNabler (libadrenotools) patches the driver in memory to expose them, which saves the
         // software decoding (and BC6H/BC7 then look right).
@@ -1443,6 +1758,7 @@ private:
         VkPhysicalDeviceFeatures en{};
         en.textureCompressionBC = have.features.textureCompressionBC;
         en.textureCompressionETC2 = have.features.textureCompressionETC2;
+        en.textureCompressionASTC_LDR = have.features.textureCompressionASTC_LDR;
         en.samplerAnisotropy = have.features.samplerAnisotropy;
         en.shaderImageGatherExtended = have.features.shaderImageGatherExtended;
         en.fillModeNonSolid = have.features.fillModeNonSolid;
@@ -1454,15 +1770,19 @@ private:
         en.fragmentStoresAndAtomics = have.features.fragmentStoresAndAtomics;
         en.geometryShader = have.features.geometryShader;  // gl_PrimitiveID in fragment shaders
         en.shaderStorageImageWriteWithoutFormat = have.features.shaderStorageImageWriteWithoutFormat;
+        // skip_hidden 3 counts the samples of a draw (large surfaces are never left out); without this the occlusion
+        // queries only say "some sample / none" (a non-precise query returns 1).
+        en.occlusionQueryPrecise = have.features.occlusionQueryPrecise;
         features_ = en;
+        LOGI(kTag, "occlusion queries: precise %d", int(en.occlusionQueryPrecise));
         VkPhysicalDeviceVulkan13Features en13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
         en13.dynamicRendering = have13.dynamicRendering;
         VkPhysicalDeviceFeatures2 en2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
         en2.features = en;
         if (v13) en2.pNext = &en13;
-        LOGI(kTag, "features: dynamic rendering %d, BC textures %d, ETC2 textures %d, anisotropy %d, gather-extended %d",
+        LOGI(kTag, "features: dynamic rendering %d, BC textures %d, ETC2 textures %d, ASTC textures %d, anisotropy %d, gather-extended %d",
              int(en13.dynamicRendering), int(en.textureCompressionBC), int(en.textureCompressionETC2),
-             int(en.samplerAnisotropy), int(en.shaderImageGatherExtended));
+             int(en.textureCompressionASTC_LDR), int(en.samplerAnisotropy), int(en.shaderImageGatherExtended));
 
         float prio = 1.0f;
         VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
@@ -1549,6 +1869,12 @@ private:
                 qi.queryCount = 2;
                 if (vkCreateQueryPool(device_, &qi, nullptr, &sl.ts) != VK_SUCCESS) sl.ts = VK_NULL_HANDLE;
             }
+            {
+                VkQueryPoolCreateInfo oi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+                oi.queryType = VK_QUERY_TYPE_OCCLUSION;
+                oi.queryCount = kOccQueries;
+                if (vkCreateQueryPool(device_, &oi, nullptr, &sl.occ) != VK_SUCCESS) sl.occ = VK_NULL_HANDLE;
+            }
             desc_pool_ = MakeDescriptorPool();
             if (!CreateStream() || !desc_pool_) return false;
             if (!persist_pool_) CreatePersistentPool();
@@ -1562,6 +1888,8 @@ private:
         vkCreateSemaphore(device_, &sci, nullptr, &acquire_sem_);
         vkCreateSemaphore(device_, &sci, nullptr, &render_sem_);
         LoadPipelineCache();
+        LoadShaderCache();
+        WarmupShaders();
         init_failed_ = false;
         LOGI(kTag, "device ready (queue family %u)", family_);
         return true;
@@ -1677,15 +2005,31 @@ private:
     void WritePipelineCache() {
         const std::string path = PipelineCachePath();
         if (!pipeline_cache_ || path.empty()) return;
+        // The compiler threads may add pipelines between the size query and the data query: the second then returns
+        // VK_INCOMPLETE and (before) nothing was written. A Mali keeps ~14 KB a pipeline (a 1600-pipeline cache is
+        // ~20 MB), so a burst of new scenery easily outgrows the size asked for: ask again with room to spare
+        // (a quarter more and 1 MB), up to five tries (as gu-native does).
+        std::vector<uint8_t> data;
         size_t n = 0;
-        if (vkGetPipelineCacheData(device_, pipeline_cache_, &n, nullptr) != VK_SUCCESS || !n) return;
-        std::vector<uint8_t> data(n);
-        if (vkGetPipelineCacheData(device_, pipeline_cache_, &n, data.data()) != VK_SUCCESS) return;
+        VkResult res = VK_INCOMPLETE;
+        for (int tries = 0; tries < 5 && res == VK_INCOMPLETE; tries++) {
+            n = 0;
+            if (vkGetPipelineCacheData(device_, pipeline_cache_, &n, nullptr) != VK_SUCCESS || !n) return;
+            n += n / 4 + (size_t(1) << 20);
+            data.assign(n, 0);
+            res = vkGetPipelineCacheData(device_, pipeline_cache_, &n, data.data());
+        }
+        if (res != VK_SUCCESS) {
+            LOGW(kTag, "pipeline cache not saved: vkGetPipelineCacheData returned %d", int(res));
+            return;
+        }
         const std::string tmp = path + ".tmp";
         if (FILE* f = fopen(tmp.c_str(), "wb")) {
             const bool ok = fwrite(data.data(), 1, n, f) == n;
             fclose(f);
             if (ok) rename(tmp.c_str(), path.c_str());
+            else remove(tmp.c_str());
+            LOGI(kTag, "pipeline cache %s: %zu KB", ok ? "saved" : "NOT saved (write failed)", n >> 10);
         }
     }
 
@@ -1860,6 +2204,8 @@ private:
         // display hardware, as a rule) instead of the GPU clearing and filling a screen-sized image every frame
         // (2340x1080 from 1560x720 on the OnePlus 6T: twice the pixels of the game's own frame).
         const VkExtent2D window_extent = extent;
+        win_w_ = int(window_extent.width);  // hud_full_res sizes its image from this (see HudUpdateSize)
+        win_h_ = int(window_extent.height);
         if (dsr::GetRuntime().config.compositor_scaling && frame_w_ > 0 && frame_h_ > 0 && extent.width && extent.height) {
             const double k = std::max(double(frame_w_) / extent.width, double(frame_h_) / extent.height);
             if (k < 0.999) {
@@ -1998,6 +2344,20 @@ private:
     // 4x4 block; decoded RGBA8 is 4x larger), which saves memory and texture bandwidth on Mali.
     BcTo BcTarget(int nvn_format) {
         const dsr::RuntimeConfig& c = dsr::GetRuntime().config;
+        const VkFormatFeatureFlags need = VK_FORMAT_FEATURE_TRANSFER_DST_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
+        // bc5_astc: BC5 (two channels, normal maps) as ASTC luminance + alpha, two weight planes.
+        if (c.bc5_astc && features_.textureCompressionASTC_LDR && IsAstcLaEncodable(nvn_format)) {
+            VkFormatProperties p;
+            vkGetPhysicalDeviceFormatProperties(phys_, ConvertedFormat(nvn_format, BcTo::AstcLa), &p);
+            if ((p.optimalTilingFeatures & need) == need) return BcTo::AstcLa;
+        }
+        // bc_astc: ASTC (astc_block x astc_block) for BC1 and BC3 when the GPU has it (all Mali); a format it cannot
+        // take falls through to the ETC2 choice below.
+        if (c.bc_astc && features_.textureCompressionASTC_LDR && IsAstcEncodable(nvn_format)) {
+            VkFormatProperties p;
+            vkGetPhysicalDeviceFormatProperties(phys_, ConvertedFormat(nvn_format, BcTo::Astc), &p);
+            if ((p.optimalTilingFeatures & need) == need) return BcTo::Astc;
+        }
         if (!features_.textureCompressionETC2 || !c.bc_etc2) return BcTo::Decoded;
         BcTo to = BcTo::Decoded;
         if (IsEtcEncodable(nvn_format)) to = BcTo::Etc2;
@@ -2005,7 +2365,6 @@ private:
         if (to == BcTo::Decoded) return to;
         VkFormatProperties p;
         vkGetPhysicalDeviceFormatProperties(phys_, ConvertedFormat(nvn_format, to), &p);
-        const VkFormatFeatureFlags need = VK_FORMAT_FEATURE_TRANSFER_DST_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
         return (p.optimalTilingFeatures & need) == need ? to : BcTo::Decoded;
     }
 
@@ -2042,7 +2401,12 @@ private:
                 chosen = f;
                 feats = p.optimalTilingFeatures;
                 LOGI(kTag, "NVN format %d (block-compressed) not supported by the GPU: %s on upload (Vulkan format %d)",
-                     nvn_format, to == BcTo::Decoded ? "decoded" : "re-encoded as ETC2", int(f));
+                     nvn_format,
+                     to == BcTo::Decoded ? "decoded"
+                     : to == BcTo::Astc ? (AstcBlock() == 6 ? "re-encoded as ASTC 6x6 (world textures; the HUD, text and small textures 4x4)" : AstcBlock() == 8 ? "re-encoded as ASTC 8x8 (world textures; the HUD, text and small textures 4x4)" : "re-encoded as ASTC 4x4")
+                     : to == BcTo::AstcLa ? "re-encoded as ASTC luminance+alpha (dual plane)"
+                                          : "re-encoded as ETC2",
+                     int(f));
                 if (BcKindOf(nvn_format) == BcKind::BC7 || BcKindOf(nvn_format) == BcKind::BC6H_S ||
                     BcKindOf(nvn_format) == BcKind::BC6H_U)
                     LOGW(kTag, "NVN format %d: decoding not implemented yet, shown as grey", nvn_format);
@@ -2061,6 +2425,7 @@ private:
         Image* img = FindImage(t);
         if (!img) img = CreateImage(t);
         if (!img) return nullptr;
+        if (img->pending && !img->written) return nullptr;  // converting in the background: not drawn yet
         if (upload && TakeFrame(*img, t)) return img;
         if (upload && !img->written && !img->uploaded) {
             Upload(*img, t);
@@ -2244,7 +2609,7 @@ private:
         img.tex = t.tex;
         img.vk_format = vf;
         if (BcKindOf(t.tex.format) != BcKind::None)  // a BC texture in a format the GPU has instead: converted
-            for (BcTo to : {BcTo::Etc2, BcTo::Etc2Rgba8, BcTo::Decoded})
+            for (BcTo to : {BcTo::Astc, BcTo::AstcLa, BcTo::Etc2, BcTo::Etc2Rgba8, BcTo::Decoded})
                 if (vf == ConvertedFormat(t.tex.format, to) && (to == BcTo::Decoded || vf != BcDecodedFormat(t.tex.format))) {
                     img.bc = BcKindOf(t.tex.format);
                     img.bc_to = to;
@@ -2254,6 +2619,23 @@ private:
         img.height = t.tex.height;
         img.levels = std::max(1, std::min(t.tex.levels, int(layout.levels.size())));
         img.layers = std::max(1, layout.layers);
+        // astc_block 6 / 8 is for the game's world art: textures with a long mip chain. The HUD, menus and text
+        // (a single level: atlases, fonts, icons, backgrounds) and small textures stay 4x4, where they stay sharp.
+        if (img.bc != BcKind::None && (img.bc_to == BcTo::Astc || img.bc_to == BcTo::AstcLa)) {
+            int blk = AstcBlock();
+            const bool world_art = img.levels >= 4 && std::min(t.tex.width, t.tex.height) >= 128 &&
+                                   t.tex.target != kTarget3D && t.tex.target != kTarget1D && t.tex.target != kTarget1DArray;
+            if (blk > 4 && !world_art) blk = 4;
+            img.astc_block = blk;
+            if (blk != AstcBlock()) {
+                vf = ConvertedFormat(t.tex.format, img.bc_to, blk);
+                img.vk_format = vf;
+                astc_ui_kept_++;
+                if (astc_ui_kept_ <= 8)
+                    LOGI(kTag, "ASTC %dx%d requested; texture %dx%d format %d (%d levels) is not world art: ASTC 4x4",
+                         AstcBlock(), AstcBlock(), t.tex.width, t.tex.height, t.tex.format, img.levels);
+            }
+        }
         // texture_mip_skip: big BC textures (the game's art; never drawn into) without their most detailed level.
         if (mip_skip_ && BcKindOf(t.tex.format) != BcKind::None && img.levels >= 2 && t.tex.width >= 512 &&
             t.tex.height >= 512 && t.tex.target != kTarget3D && t.tex.target != kTarget1D &&
@@ -2351,6 +2733,8 @@ private:
         switch (img.bc_to) {
             case BcTo::Etc2: return EtcLevelBytes(w, h, d);
             case BcTo::Etc2Rgba8: return EtcRgba8LevelBytes(w, h, d);
+            case BcTo::Astc:
+            case BcTo::AstcLa: return AstcLevelBytes(w, h, d, img.astc_block);
             default: return size_t(w) * size_t(h) * size_t(d) * size_t(BcDecodedBytes(img.bc));
         }
     }
@@ -2368,7 +2752,8 @@ private:
         int bx, brows, w, h, depth;
         uint8_t* out;
         size_t out_bytes;
-        uint64_t key;  // ETC2 cache key (0: not cached)
+        uint64_t key;  // ETC2 / ASTC cache key (0: not cached)
+        int astc;      // ASTC block size (4, 6, 8) when `to` is ASTC
     };
     struct BcTask {
         uint32_t job;
@@ -2384,27 +2769,127 @@ private:
     double bc_convert_ms_ = 0;     // conversion time, for the stats line
     uint64_t bc_cache_hits_ = 0, bc_converted_levels_ = 0;
 
-    void RunBcJobs() {
-        if (bc_jobs_.empty()) return;
-        const auto t0 = std::chrono::steady_clock::now();
-        bc_tasks_.clear();
-        for (uint32_t j = 0; j < bc_jobs_.size(); j++) {
-            const BcJob& job = bc_jobs_[j];
-            const int band = std::max(2, 4096 / std::max(1, job.bx));  // ~4096 blocks per task
+    // ---- BC textures: converted on a background thread --------------------------------------------------
+    // Converting a large texture takes seconds on a phone; done on the render thread it stalled the game. Now one
+    // background thread converts it (WorkPool helps), and the render thread records the copy a few frames later
+    // (PumpBcUploads), at most kBcFrameBudget bytes per frame. Until the copy is recorded the texture is not drawn.
+    static constexpr size_t kBcFrameBudget = size_t(24) << 20;
+    // Converted textures up to this size are not queued. Frame logs (Mali, BC3 -> ETC2) show about 200-400 ms per MB on
+    // the render thread: a 2 MB texture converted here was a 400-600 ms hitch, so only HUD-sized ones are done inline.
+    static constexpr size_t kBcSyncBytes = size_t(128) << 10;
+    // Time the render thread may spend per frame converting small textures on the spot. A zone load brings 100+
+    // textures at once and every conversion costs ~25 ms here (log of 2026-11-19: 3.4 s and 2.4 s stalls with 0 ms
+    // waiting for the GPU); past this budget the rest go to the background thread like the big ones.
+    static constexpr double kBcSyncFrameMs = 6.0;
+    static constexpr double kBcMaxWaitMs = 3000.0;  // a queued conversion waiting this long is taken next
+    double bc_sync_ms_ = 0;  // render thread: milliseconds spent on spot conversions in the current frame
+
+    struct PendingLevel {
+        size_t src_off = 0, n = 0, out_off = 0, out_bytes = 0;
+        LevelLayout lay;
+        bool linear = false;
+        int bx = 0, brows = 0, w = 1, h = 1, depth = 1;
+    };
+    struct PendingBc {
+        uint64_t addr = 0, serial = 0;
+        int nvn_format = 0;
+        BcKind kind = BcKind::None;
+        BcTo to = BcTo::Decoded;
+        int astc = 4;  // ASTC block size of this texture
+        bool punch = false;
+        std::vector<uint8_t> raw;                // a copy of the texture's guest memory (the game may rewrite it)
+        std::vector<PendingLevel> levels;
+        std::vector<VkBufferImageCopy> regions;  // bufferOffset relative to `result`
+        size_t result_bytes = 0;
+        std::vector<uint8_t> result;             // converted levels, back to back (filled by the background thread)
+        uint64_t cache_hits = 0;
+        std::chrono::steady_clock::time_point queued_at = std::chrono::steady_clock::now();
+        std::atomic<bool> done{false};
+    };
+    std::deque<std::shared_ptr<PendingBc>> bc_queue_;     // to the background thread (under bc_mutex_)
+    std::deque<std::shared_ptr<PendingBc>> bc_inflight_;  // render thread: queued order, recorded when done
+    std::mutex bc_mutex_, etc_mutex_;
+    std::condition_variable bc_cv_;
+    bool bc_stop_ = false;
+    std::thread bc_thread_;
+    uint64_t image_serial_ = 0, bc_queued_ = 0;
+
+    void EnsureBcThread() {
+        if (!bc_thread_.joinable()) bc_thread_ = std::thread([this] { BcThreadLoop(); });
+    }
+    void StopBcThread() {
+        {
+            std::lock_guard<std::mutex> lk(bc_mutex_);
+            bc_stop_ = true;
+        }
+        bc_cv_.notify_all();
+        if (bc_thread_.joinable()) bc_thread_.join();
+    }
+    void BcThreadLoop() {
+        int nice_now = 10;
+        setpriority(PRIO_PROCESS, 0, nice_now);  // background conversion yields to the game and render threads (see WorkPool)
+        for (;;) {
+            std::shared_ptr<PendingBc> p;
+            {
+                std::unique_lock<std::mutex> lk(bc_mutex_);
+                bc_cv_.wait(lk, [this] { return bc_stop_ || !bc_queue_.empty(); });
+                if (bc_queue_.empty()) return;  // stop requested and nothing left to convert
+                // Smallest texture first: HUD, icons and small props become visible long before one big texture
+                // is done (each queued texture is drawn as a white stand-in until its copy lands). A job that
+                // has waited kBcMaxWaitMs goes first so big ones are not starved by a stream of small ones.
+                const auto now = std::chrono::steady_clock::now();
+                size_t best = 0;
+                bool aged = false;
+                for (size_t i = 0; i < bc_queue_.size(); i++) {
+                    if (std::chrono::duration<double, std::milli>(now - bc_queue_[i]->queued_at).count() > kBcMaxWaitMs) {
+                        best = i;
+                        aged = true;
+                        break;
+                    }
+                    if (bc_queue_[i]->result_bytes < bc_queue_[best]->result_bytes) best = i;
+                }
+                (void)aged;
+                p = bc_queue_[best];
+                bc_queue_.erase(bc_queue_.begin() + std::ptrdiff_t(best));
+                // A deep queue is a zone load: convert at normal priority; back to background when it drains.
+                const int want = bc_queue_.size() >= 8 ? 0 : 10;
+                if (want != nice_now) {
+                    nice_now = want;
+                    setpriority(PRIO_PROCESS, 0, nice_now);
+                }
+            }
+            ConvertPending(*p);
+            p->done.store(true, std::memory_order_release);
+        }
+    }
+
+    // Converts the BC jobs (BC -> RGBA8 or ETC2) with WorkPool; the tasks of each job write its own output.
+    void ConvertJobs(const std::vector<BcJob>& jobs) {
+        if (jobs.empty()) return;
+        std::vector<BcTask> tasks;
+        for (uint32_t j = 0; j < jobs.size(); j++) {
+            const BcJob& job = jobs[j];
+            int band = std::max(2, 4096 / std::max(1, job.bx));  // ~4096 blocks per task
+            if (job.to == BcTo::Astc || job.to == BcTo::AstcLa) {
+                // a task writes whole ASTC block rows: its bands are a multiple of lcm(4, block) texel rows
+                const int unit = AstcBlockDim(job.astc) == 6 ? 3 : AstcBlockDim(job.astc) == 8 ? 2 : 1;  // BC block rows
+                band = (band + unit - 1) / unit * unit;
+            }
             for (int z = 0; z < job.depth; z++)
                 for (int r = 0; r < job.brows && r * 4 < job.h; r += band)
-                    bc_tasks_.push_back({j, z, r, std::min(band, job.brows - r)});
+                    tasks.push_back({j, z, r, std::min(band, job.brows - r)});
         }
-        WorkPool::Get().Run(bc_tasks_.size(), [this](size_t i) {
+        WorkPool::Get().Run(tasks.size(), [&](size_t i) {
             thread_local std::vector<uint8_t> rgba;
-            const BcTask& k = bc_tasks_[i];
-            const BcJob& j = bc_jobs_[k.job];
+            const BcTask& k = tasks[i];
+            const BcJob& j = jobs[k.job];
             const int bpb = (j.kind == BcKind::BC1 || j.kind == BcKind::BC4U || j.kind == BcKind::BC4S) ? 8 : 16;
             const uint8_t* blocks = j.blocks + (size_t(k.z) * size_t(j.brows) + size_t(k.row0)) * size_t(j.bx) * bpb;
             const int y0 = k.row0 * 4, hh = std::min(j.h - y0, k.rows * 4);
             const size_t slice = j.out_bytes / size_t(std::max(1, j.depth));
             uint8_t* out = j.out + size_t(k.z) * slice;
             const int bxn = (j.w + 3) / 4;
+            const int ab = AstcBlockDim(j.astc), abx = (j.w + ab - 1) / ab;  // ASTC blocks per row, and its block size
             switch (j.to) {
                 case BcTo::Decoded:
                     BcDecode(j.kind, blocks, j.bx, k.rows, out + size_t(y0) * size_t(j.w) * size_t(BcDecodedBytes(j.kind)),
@@ -2419,30 +2904,205 @@ private:
                     else
                         EncodeEtc2Rgba8(out + size_t(k.row0) * size_t(bxn) * 16, rgba.data(), j.w, hh, 1);
                     break;
+                case BcTo::Astc:
+                    rgba.resize(size_t(j.w) * size_t(hh) * 4);
+                    BcDecode(j.kind, blocks, j.bx, k.rows, rgba.data(), j.w, hh);
+                    EncodeAstc(out + size_t(y0 / ab) * size_t(abx) * 16, rgba.data(), j.w, hh, 1, ab);
+                    break;
+                case BcTo::AstcLa:  // BC5: decoded to two channels (R8G8), encoded as luminance + alpha
+                    rgba.resize(size_t(j.w) * size_t(hh) * 2);
+                    BcDecode(j.kind, blocks, j.bx, k.rows, rgba.data(), j.w, hh);
+                    EncodeAstcLA(out + size_t(y0 / ab) * size_t(abx) * 16, rgba.data(), j.w, hh, 1, ab);
+                    break;
             }
         });
-        for (const BcJob& j : bc_jobs_) {
-            bc_converted_levels_++;
-            if (!j.key) continue;
-            if (etc_cache_bytes_ + j.out_bytes > kEtcCacheLimit) {
-                etc_cache_.clear();
-                etc_cache_bytes_ = 0;
+    }
+
+    // Background thread: deswizzles every level, takes what the ETC2 cache has, converts the rest.
+    void ConvertPending(PendingBc& p) {
+        p.result.assign(p.result_bytes, 0);
+        size_t blocks_total = 0;
+        for (const PendingLevel& L : p.levels) blocks_total += L.n;
+        std::vector<uint8_t> blocks(blocks_total);
+        std::vector<BcJob> jobs;
+        std::vector<uint64_t> keys;  // parallel to jobs: the ETC2 cache key (0: not cached)
+        size_t off = 0;
+        for (const PendingLevel& L : p.levels) {
+            uint8_t* dst = blocks.data() + off;
+            off += L.n;
+            if (L.linear)
+                memcpy(dst, p.raw.data() + L.src_off, L.n);
+            else
+                DeswizzleLevel(dst, p.raw.data() + L.src_off, L.lay);
+            uint8_t* out = p.result.data() + L.out_off;
+            uint64_t key = 0;
+            if (p.to != BcTo::Decoded) {
+                key = HashStep(Fnv(dst, L.n), uint64_t(p.nvn_format) << 48 ^ uint64_t(p.to) << 44 ^ uint64_t(p.astc) << 36 ^ uint64_t(L.w) << 24 ^ uint64_t(L.h) ^
+                                                  uint64_t(L.depth) << 40) | 1;
+                std::lock_guard<std::mutex> lk(etc_mutex_);
+                auto hit = etc_cache_.find(key);
+                if (hit != etc_cache_.end() && hit->second.size() == L.out_bytes) {
+                    memcpy(out, hit->second.data(), L.out_bytes);
+                    p.cache_hits++;
+                    continue;
+                }
             }
-            auto& e = etc_cache_[j.key];
-            etc_cache_bytes_ += j.out_bytes - e.size();
-            e.assign(j.out, j.out + j.out_bytes);
+            jobs.push_back(BcJob{p.kind, p.to, p.punch, dst, L.bx, L.brows, L.w, L.h, L.depth, out, L.out_bytes, key,
+                                 p.astc});
+            keys.push_back(key);
         }
-        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-        bc_convert_ms_ += ms;
-        static int logged = 0;
-        if (ms > 30 && logged++ < 20)
-            LOGI(kTag, "texture conversion: %zu levels in %zu tasks, %.1f ms (%d workers + render thread)",
-                 bc_jobs_.size(), bc_tasks_.size(), ms, WorkPool::Get().Workers());
-        bc_jobs_.clear();
+        p.raw.clear();
+        p.raw.shrink_to_fit();  // the copy of the game memory is no longer needed
+        ConvertJobs(jobs);
+        if (p.to != BcTo::Decoded) {
+            std::lock_guard<std::mutex> lk(etc_mutex_);
+            for (size_t i = 0; i < jobs.size(); i++) {
+                if (!keys[i]) continue;
+                const BcJob& j = jobs[i];
+                if (etc_cache_bytes_ + j.out_bytes > kEtcCacheLimit) {
+                    etc_cache_.clear();
+                    etc_cache_bytes_ = 0;
+                }
+                auto& e = etc_cache_[j.key];
+                etc_cache_bytes_ += j.out_bytes - e.size();
+                e.assign(j.out, j.out + j.out_bytes);
+            }
+        }
+    }
+
+    // Render thread: queues a BC texture for the background thread. The image is not drawn until PumpBcUploads
+    // has recorded its copy (a re-upload keeps the old contents meanwhile).
+    void EnqueueBcUpload(Image& img, const TexRef& t, const TextureLayout& layout, const FormatInfo& fi) {
+        auto p = std::make_shared<PendingBc>();
+        p->addr = t.addr;
+        p->serial = img.serial = ++image_serial_;
+        p->nvn_format = img.nvn_format;
+        p->kind = img.bc;
+        p->to = img.bc_to;
+        p->astc = img.astc_block;
+        p->punch = EtcHasPunchThrough(img.nvn_format);
+        const uint8_t* base = reinterpret_cast<const uint8_t*>(t.addr);
+        p->raw.assign(base, base + layout.total);
+        size_t out = 0;
+        for (int layer = 0; layer < img.layers; layer++)
+            for (int lv = 0; lv < img.levels; lv++) {
+                const LevelLayout& l = layout.levels[size_t(lv + img.mip_skip)];
+                PendingLevel L;
+                L.src_off = size_t(layer) * layout.layer_stride + l.offset;
+                L.n = size_t(l.row_bytes) * l.rows * l.depth;
+                L.lay = l;
+                L.linear = layout.linear;
+                L.w = std::max(1, l.width);
+                L.h = std::max(1, l.height);
+                L.depth = l.depth;
+                L.bx = l.row_bytes / std::max(1, fi.bytes_per_block);
+                L.brows = l.rows;
+                L.out_bytes = ConvertedLevelBytes(img, L.w, L.h, L.depth);
+                out = (out + 15) & ~size_t(15);
+                L.out_off = out;
+                out += L.out_bytes;
+                VkBufferImageCopy r{};
+                r.bufferOffset = L.out_off;
+                r.imageSubresource = {img.aspect & ~VK_IMAGE_ASPECT_STENCIL_BIT ? img.aspect & ~VK_IMAGE_ASPECT_STENCIL_BIT
+                                                                                 : img.aspect,
+                                      uint32_t(lv), uint32_t(layer), 1};
+                r.imageExtent = {uint32_t(L.w), uint32_t(img.type == VK_IMAGE_TYPE_1D ? 1 : L.h), uint32_t(L.depth)};
+                p->regions.push_back(r);
+                p->levels.push_back(L);
+            }
+        p->result_bytes = out;
+        // Small conversions are done right here and recorded now: a texture that is queued is drawn with a white
+        // stand-in until its copy lands, and those few frames read as flicker. Only big ones go to the thread.
+        if (out <= kBcSyncBytes && bc_sync_ms_ < kBcSyncFrameMs && StreamRemaining() >= out + 1024) {
+            const auto sync_t0 = std::chrono::steady_clock::now();
+            ConvertPending(*p);
+            bc_sync_ms_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - sync_t0).count();
+            p->done.store(true, std::memory_order_release);
+            Begin();
+            EndRendering();
+            const VkDeviceSize off = StreamAlloc(out, 16);
+            memcpy(stream_ptr_ + off, p->result.data(), out);
+            std::vector<VkBufferImageCopy> regions = p->regions;
+            for (VkBufferImageCopy& r : regions) r.bufferOffset += off;
+            Transition(img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+            Rec([regions = std::move(regions), buf = stream_, image = img.image](VkCommandBuffer cb) {
+                vkCmdCopyBufferToImage(cb, buf, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, uint32_t(regions.size()),
+                                       regions.data());
+            });
+            img.written = true;
+            img.pending = false;
+            uploads_++;
+            bc_converted_levels_ += p->levels.size();
+            bc_cache_hits_ += p->cache_hits;
+            return;
+        }
+        img.pending = true;
+        EnsureBcThread();
+        {
+            std::lock_guard<std::mutex> lk(bc_mutex_);
+            bc_queue_.push_back(p);
+        }
+        bc_cv_.notify_one();
+        bc_inflight_.push_back(p);
+        if (++bc_queued_ <= 24)
+            LOGI(kTag, "texture %dx%d format %d: converting in the background (%zu bytes)", img.width, img.height,
+                 img.nvn_format, out);
+    }
+
+    // Render thread, once per frame: records the copies of converted textures, in the order they were queued,
+    // at most kBcFrameBudget bytes per frame. A result whose texture was replaced or released is dropped.
+    void PumpBcUploads() {
+        bc_sync_ms_ = 0;
+        if (bc_inflight_.empty()) return;
+        size_t budget = kBcFrameBudget;
+        bool ended = false;
+        // Any finished result is recorded, not just the oldest: the thread finishes small textures first, and a
+        // big one at the head of the queue must not hold them back.
+        for (auto qi = bc_inflight_.begin(); qi != bc_inflight_.end();) {
+            if (!(*qi)->done.load(std::memory_order_acquire)) {
+                ++qi;
+                continue;
+            }
+            std::shared_ptr<PendingBc> p = *qi;
+            auto it = images_.find(p->addr);
+            if (it == images_.end() || !it->second.pending || it->second.serial != p->serial) {
+                qi = bc_inflight_.erase(qi);
+                continue;
+            }
+            const size_t bytes = p->result_bytes;
+            if (bytes > budget && budget < kBcFrameBudget) {  // does not fit in what is left: a smaller one may
+                ++qi;
+                continue;
+            }
+            if (StreamRemaining() < bytes + 1024) break;  // the stream is reset next frame
+            if (!ended) {
+                EndRendering();
+                ended = true;
+            }
+            Image& img = it->second;
+            const VkDeviceSize off = StreamAlloc(bytes, 16);
+            memcpy(stream_ptr_ + off, p->result.data(), bytes);
+            std::vector<VkBufferImageCopy> regions = p->regions;
+            for (VkBufferImageCopy& r : regions) r.bufferOffset += off;
+            Transition(img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+            Rec([regions = std::move(regions), buf = stream_, image = img.image](VkCommandBuffer cb) {
+                vkCmdCopyBufferToImage(cb, buf, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, uint32_t(regions.size()),
+                                       regions.data());
+            });
+            img.written = true;
+            img.pending = false;
+            uploads_++;
+            bc_converted_levels_ += p->levels.size();
+            bc_cache_hits_ += p->cache_hits;
+            budget = budget > bytes ? budget - bytes : 0;
+            std::vector<uint8_t>().swap(p->result);  // free the CPU copy of the converted texels
+            qi = bc_inflight_.erase(qi);
+        }
     }
 
     // Fills a sampled texture from game memory: deswizzle each level/layer into the stream, then copy.
     void Upload(Image& img, const TexRef& t) {
+        if (img.pending) return;  // already on its way (a re-upload while the first conversion runs)
         img.uploaded = true;
         img.cpu_source = true;
         img.sample_hash = SampleHash(t);
@@ -2468,66 +3128,31 @@ private:
             LogOnce("upload-size", "texture too large to upload in one go (%zu bytes)", needed);
             return;
         }
+        if (img.bc != BcKind::None) {
+            EnqueueBcUpload(img, t, layout, fi);
+            return;
+        }
         Begin();
         EndRendering();
         if (StreamRemaining() < needed + 1024) Flush();
         std::vector<VkBufferImageCopy> regions;
         const uint8_t* base = reinterpret_cast<const uint8_t*>(t.addr);
-        if (img.bc != BcKind::None) {  // room for every level's deswizzled blocks (converted after the loop)
-            size_t scratch = 0;
-            for (int layer = 0; layer < img.layers; layer++)
-                for (int lv = 0; lv < img.levels; lv++) {
-                    const LevelLayout& l = layout.levels[size_t(lv + img.mip_skip)];
-                    scratch += size_t(l.row_bytes) * l.rows * l.depth;
-                }
-            if (bc_scratch_.size() < scratch) bc_scratch_.resize(scratch);
-        }
         size_t scratch_used = 0;
+        (void)scratch_used;
         for (int layer = 0; layer < img.layers; layer++) {
             for (int lv = 0; lv < img.levels; lv++) {
                 const LevelLayout& l = layout.levels[size_t(lv + img.mip_skip)];
                 const size_t n = size_t(l.row_bytes) * l.rows * l.depth;
                 const uint8_t* src = base + size_t(layer) * layout.layer_stride + l.offset;
+                VkDeviceSize off = StreamAlloc(n, 16);
+                if (layout.linear)
+                    memcpy(stream_ptr_ + off, src, n);
+                else
+                    DeswizzleLevel(stream_ptr_ + off, src, l);
                 VkBufferImageCopy r{};
-                if (img.bc != BcKind::None) {
-                    // Deswizzle the blocks now; they are converted into the upload buffer after the loop (RunBcJobs),
-                    // in parallel, or copied from the ETC2 cache.
-                    uint8_t* blocks = bc_scratch_.data() + scratch_used;
-                    scratch_used += n;
-                    if (layout.linear)
-                        memcpy(blocks, src, n);
-                    else
-                        DeswizzleLevel(blocks, src, l);
-                    const int w = std::max(1, l.width), h = std::max(1, l.height);
-                    const size_t out_bytes = ConvertedLevelBytes(img, w, h, l.depth);
-                    VkDeviceSize off = StreamAlloc(out_bytes, 16);
-                    BcJob job{img.bc, img.bc_to, EtcHasPunchThrough(img.nvn_format), blocks,
-                              int(l.row_bytes / std::max(1, fi.bytes_per_block)), int(l.rows), w, h, l.depth,
-                              stream_ptr_ + off, out_bytes, 0};
-                    bool cached = false;
-                    if (img.bc_to != BcTo::Decoded) {
-                        job.key = HashStep(Fnv(blocks, n), uint64_t(img.nvn_format) << 48 ^ uint64_t(w) << 24 ^
-                                                               uint64_t(h) ^ uint64_t(l.depth) << 40) | 1;
-                        auto hit = etc_cache_.find(job.key);
-                        if (hit != etc_cache_.end() && hit->second.size() == out_bytes) {
-                            memcpy(job.out, hit->second.data(), out_bytes);
-                            bc_cache_hits_++;
-                            cached = true;
-                        }
-                    }
-                    if (!cached) bc_jobs_.push_back(job);
-                    r.bufferOffset = off;
-                    bc_decoded_bytes_ += n;
-                } else {
-                    VkDeviceSize off = StreamAlloc(n, 16);
-                    if (layout.linear)
-                        memcpy(stream_ptr_ + off, src, n);
-                    else
-                        DeswizzleLevel(stream_ptr_ + off, src, l);
-                    r.bufferOffset = off;
-                    r.bufferRowLength = uint32_t(l.row_bytes / fi.bytes_per_block * fi.block_w);
-                    r.bufferImageHeight = uint32_t(l.rows * fi.block_h);
-                }
+                r.bufferOffset = off;
+                r.bufferRowLength = uint32_t(l.row_bytes / fi.bytes_per_block * fi.block_w);
+                r.bufferImageHeight = uint32_t(l.rows * fi.block_h);
                 r.imageSubresource = {img.aspect & ~VK_IMAGE_ASPECT_STENCIL_BIT ? img.aspect & ~VK_IMAGE_ASPECT_STENCIL_BIT
                                                                                  : img.aspect,
                                       uint32_t(lv), uint32_t(layer), 1};
@@ -2536,7 +3161,6 @@ private:
                 regions.push_back(r);
             }
         }
-        RunBcJobs();  // the converted texels are in the stream before the copy is recorded
         Transition(img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
         Rec([regions = std::move(regions), buf = stream_, image = img.image](VkCommandBuffer cb) {
             vkCmdCopyBufferToImage(cb, buf, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, uint32_t(regions.size()),
@@ -2562,7 +3186,7 @@ private:
     VkFormat ViewFormat(const Image& img, int view_nvn) {
         if (!view_nvn || view_nvn == img.nvn_format) return VK_FORMAT_UNDEFINED;
         if (img.bc != BcKind::None && BcKindOf(view_nvn) != BcKind::None) {  // converted: compare converted formats
-            const VkFormat f = ConvertedFormat(view_nvn, img.bc_to);
+            const VkFormat f = ConvertedFormat(view_nvn, img.bc_to, img.astc_block);
             if (f == img.vk_format) return VK_FORMAT_UNDEFINED;
             if (f == img.twin && f != VK_FORMAT_UNDEFINED) return f;
         }
@@ -2599,7 +3223,12 @@ private:
         ci.image = img.image;
         ci.viewType = type;
         ci.format = format != VK_FORMAT_UNDEFINED ? format : img.vk_format;
-        ci.components = {Swizzle(swz[0]), Swizzle(swz[1]), Swizzle(swz[2]), Swizzle(swz[3])};
+        uint8_t sw[4] = {swz[0], swz[1], swz[2], swz[3]};
+        if (img.bc != BcKind::None && img.bc_to == BcTo::AstcLa) {
+            // BC5 stored as ASTC luminance + alpha reads as (L, L, L, A); BC5 reads as (R, G, 0, 1): R from L, G from A
+            for (uint8_t& s : sw) s = s == 3 ? 5 : s == 4 ? 0 : s == 5 ? 1 : s;
+        }
+        ci.components = {Swizzle(sw[0]), Swizzle(sw[1]), Swizzle(sw[2]), Swizzle(sw[3])};
         ci.subresourceRange = {aspect, base_level, levels, base_layer, layers};
         VkImageView v = VK_NULL_HANDLE;
         if (vkCreateImageView(device_, &ci, nullptr, &v) != VK_SUCCESS) {
@@ -2713,6 +3342,7 @@ private:
                 case 3: ci.compareOp = VK_COMPARE_OP_NEVER; break;
                 default: break;
             }
+            if (dsr::GetRuntime().config.shadow_quality == 0) ci.compareOp = VK_COMPARE_OP_NEVER;  // always lit
         }
         ci.borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
         VkSampler smp = VK_NULL_HANDLE;
@@ -2744,6 +3374,8 @@ private:
         uint32_t count = 0, instances = 0, first_vertex = 0, base_instance = 0;
         int32_t vertex_offset = 0;
         uint32_t query = UINT32_MAX;  // occlusion query index (captures)
+        VkQueryPool occ_pool = VK_NULL_HANDLE;  // settings skip_hidden: the slot's occlusion pool and query index
+        uint32_t occ_q = UINT32_MAX;
         uint16_t n_vb = 0, n_tex = 0, n_ubo = 0;
     };
     // ======================================================================================================
@@ -2982,6 +3614,7 @@ private:
                 vkCmdResetQueryPool(cmd_, ts, 0, 2);
                 vkCmdWriteTimestamp(cmd_, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, ts, 0);
             }
+            if (VkQueryPool occ = slots_[i].occ) vkCmdResetQueryPool(cmd_, occ, 0, kOccQueries);
         });
     }
     struct Slot;
@@ -2996,6 +3629,269 @@ private:
             gpu_busy_ms_ += ms;
             dsr::ReportGpuFrameTime(ms);  // fps = auto weighs it against the frame period
         }
+    }
+
+    // ---- skip_prepass: the game's depth-only pass is left out, the colour pass writes the depth ------------------
+    // Frame captures: the world is drawn twice on the same depth buffer, first without colour (depth func LEQUAL,
+    // write on), then with colour (LEQUAL, write off), the same 147 draws. On a tile-based GPU the second pass needs no
+    // prepass (hidden surface removal), so the first one only repeats the vertex work and the binning. A depth buffer
+    // that had >= 16 depth-only and >= 16 colour draws last frame is treated this way this frame.
+    // Only the colour draws that have a twin in the depth-only pass (same mesh: index buffer, count, base vertex) are
+    // made to write the depth. Colour draws without a twin (decals, sky, overlays: blend off, depth write off) keep the
+    // game's state, so they cannot occlude the draws that come after them; and the prepass is only left out while at
+    // least 80% of its draws were matched by a colour draw last frame, so no depth is lost when the pairing is poor.
+    struct PrepassStat {
+        uint32_t frame = 0, pre = 0, main = 0, matched = 0;
+        bool learned = false;
+    };
+    std::unordered_map<uint64_t, PrepassStat> prepass_;
+    std::unordered_set<uint64_t> prepass_keys_;  // this frame's depth-only draws (mesh identity + depth buffer)
+    uint32_t prepass_keys_frame_ = ~0u;
+    uint64_t prepass_skipped_ = 0, prepass_converted_ = 0, prepass_unmatched_ = 0;
+    static uint64_t PrepassKey(const DrawParams& p, uint64_t depth_addr) {
+        uint64_t h = 1469598103934665603ull;
+        const auto mix = [&h](uint64_t v) {
+            h ^= v;
+            h *= 1099511628211ull;
+            h ^= h >> 29;
+        };
+        mix(depth_addr);
+        mix(p.index_address);
+        mix(uint64_t(p.count) | (uint64_t(p.index_type) << 40));
+        mix(uint64_t(int64_t(p.base_vertex)));
+        mix(uint64_t(uint32_t(p.mode)));
+        mix(uint64_t(int64_t(p.first)));
+        mix(uint64_t(uint32_t(p.instances)));
+        return h;
+    }
+    // ---- skip_hidden: draws that covered no pixels in recent frames are not drawn again -------------------------
+    // Frame captures (Mali-G57) showed that most draws of the big world passes cover no pixel at all (131 of 223 in the
+    // lit pass) yet are still vertex-shaded and tiled, which is what limits the frame on this GPU. Draws of the world
+    // passes get an occlusion query; its result (read when the submission has finished) says whether the draw
+    // produced any sample. A draw that produced none twice running is left out, and is drawn again (with a query)
+    // every kOccRetest frames, so something that comes into view shows up after a few frames at most. A draw is
+    // recognised by its pass, shaders, index data, vertex buffer and the object's part of the vertex constants.
+    struct OccState {
+        uint32_t last_test = 0;  // frame of the last draw that had a query
+        uint32_t last_seen = 0;
+        uint8_t hidden = 0;      // consecutive tests with no samples
+        bool veto = false;       // a draw of this key was drawn without a query: its visibility is unknown
+        uint64_t cst = 0;        // skip_hidden 3: hash of the first draw's object constants in cst_frame (camera motion)
+        uint32_t cst_frame = 0;
+        uint64_t test_seq = 0;     // skip_hidden 3: submission whose query result settles the last retest of this key
+        uint32_t kept_frame = 0;   // skip_hidden 3: last frame this key was drawn only because its retest was pending
+        uint16_t big = 0;          // skip_hidden 3: results left until a key that covered a large part of the target may be left out
+        uint8_t flaps = 0;         // skip_hidden 3: times it came back into view after being left out (late appearances)
+        bool force = false;        // skip_hidden 3: a neighbour in the draw order came back into view: retest on its next draw
+        uint32_t pos = 0;          // skip_hidden 3: index in occ_order_prev_ (draw order of the last finished frame)
+    };
+    static constexpr uint32_t kOccQueries = 2048;
+    static constexpr uint8_t kOccHiddenTests = 2;
+    static constexpr uint32_t kOccRetest = 3;
+    std::unordered_map<uint64_t, OccState> occ_state_;
+    uint32_t occ_frame_ = 0;
+    uint64_t occ_skipped_ = 0, occ_queried_ = 0;
+    // skip_hidden = 3, camera motion: the share of drawn keys whose object constants changed since the previous frame.
+    // While the view moves (or just started to) hidden draws are retested every kOccRetest frames, never less often, so
+    // nothing that comes into view stays missing for up to 12 frames (the texture flicker of the old level 3). The
+    // longer retest intervals only apply once the view has been still for kOccStillFrames frames.
+    static constexpr uint32_t kOccStillFrames = 8;
+    uint32_t occ_moved_ = 0, occ_seen_ = 0, occ_still_ = 0;
+    bool occ_moving_ = false;
+    uint64_t occ_woke_ = 0;  // hidden keys that showed samples again (log)
+    // skip_hidden = 3, late appearances: whatever is drawn after a hidden draw was left out is retested only every few
+    // frames, so when the camera turns, geometry came into view up to 8 frames late. Two things shorten that without
+    // retesting everything more often: (1) the draws that sit next to a draw that has just come back into view in the
+    // draw order (the game draws the map in spatial order: the next wall, floor tile or piece of sky) are retested on
+    // their next draw, as one batch with it; (2) a key that came back into view once is at the edge of what is visible,
+    // so it needs more empty results before it is left out and is retested every 3-4 frames while it stays hidden. Keys
+    // that never came back keep the long intervals, which is where the saving is.
+    std::vector<uint64_t> occ_order_, occ_order_prev_;  // judged keys in draw order: this frame / the last finished one
+    static constexpr int kOccNeighbours = 10;
+    uint64_t occ_pulled_ = 0;  // hidden keys retested early because of a neighbour (log)
+    void OccPullNeighbours(const OccState& woke, uint64_t key) {
+        const size_t n = occ_order_prev_.size();
+        if (woke.pos >= n || occ_order_prev_[woke.pos] != key) return;  // its position is from an older frame
+        const size_t pos = woke.pos, reach = size_t(kOccNeighbours);
+        const size_t lo = pos > reach ? pos - reach : 0;
+        const size_t hi = std::min<size_t>(n - 1, pos + reach);
+        for (size_t j = lo; j <= hi; j++) {
+            if (j == pos) continue;
+            auto it = occ_state_.find(occ_order_prev_[j]);
+            if (it == occ_state_.end() || it->second.hidden < kOccHiddenTests || it->second.force) continue;
+            it->second.force = true;
+            occ_pulled_++;
+        }
+    }
+    // skip_hidden = 3, no blinking: the result of a query arrives ~2 frames after the draw (the GPU has to finish the
+    // submission first). A hidden draw that is retested is really drawn on the retest frame, so if it is visible the
+    // player sees it for one frame, then it is left out again until the result arrives (1-3 frames), then it is drawn
+    // for good: a blink every time something comes into view. Now a retested draw keeps being drawn (without a
+    // query) until the submission with its query has been collected (occ_done_seq_), and only then is it judged. The
+    // retests are further apart to pay for it, and results are collected as soon as the GPU is done (PollOcclusion).
+    uint64_t occ_done_seq_ = 0;   // submissions whose queries have been collected
+    uint64_t occ_kept_ = 0;       // draws drawn only because their retest was pending (log)
+    // skip_hidden = 3, large surfaces: a draw that covered at least 1/16 of its target (sky, backdrop, fog, big walls)
+    // is never left out for kOccBigKeep results after that (about 8 s). Leaving it out saves little (few draws) and
+    // when it comes back into view a whole piece of the background would be missing for several frames.
+    static constexpr uint64_t kOccBigDiv = 16;
+    static constexpr uint16_t kOccBigKeep = 240;
+    uint64_t occ_big_ = 0;        // draws kept in because of it (log)
+    // Why draws were not judged (log line of skip_hidden): shader depth test, not indexed, not triangles, no depth
+    // target >= 256 wide, no depth test, stencil, blending, writes nothing, no vertex program / buffer, vertex
+    // constants unusable, query not recorded (pool missing or full); and the draws that were judged.
+    static constexpr int kOccReasons = 11;
+    uint64_t occ_reject_[kOccReasons] = {}, occ_judged_ = 0;
+    // The result of a finished submission's queries (its fence has signalled): render thread.
+    void CollectOcclusion(Slot& sl) {
+        occ_done_seq_ = std::max(occ_done_seq_, sl.seq);  // its queries are read below (or it had none)
+        const uint32_t n = std::min<uint32_t>(sl.occ_used, uint32_t(sl.occ_keys.size()));
+        sl.occ_used = 0;
+        if (!sl.occ || !n) {
+            sl.occ_keys.clear();
+            sl.occ_area.clear();
+            return;
+        }
+        std::vector<uint64_t>& res = occ_results_;
+        res.assign(size_t(n) * 2, 0);
+        const VkResult r = vkGetQueryPoolResults(device_, sl.occ, 0, n, res.size() * 8, res.data(), 16,
+                                                 VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+        if (r == VK_SUCCESS || r == VK_NOT_READY) {
+            // Several draws can share a key (the same mesh drawn for several objects): the key counts as visible if
+            // any of them produced a sample, and as hidden only when none did.
+            occ_agg_.clear();
+            for (uint32_t i = 0; i < n; i++) {
+                if (!res[size_t(i) * 2 + 1]) continue;  // never ran (the draw was dropped later)
+                const uint64_t smp = res[size_t(i) * 2];
+                const bool vis = smp != 0;
+                const uint32_t area = i < sl.occ_area.size() ? sl.occ_area[i] : 0;
+                const bool big = vis && area && smp * kOccBigDiv >= area;
+                const uint8_t bits = uint8_t((vis ? 1 : 0) | (big ? 2 : 0));
+                auto ins = occ_agg_.emplace(sl.occ_keys[i], bits);
+                if (!ins.second) ins.first->second |= bits;
+            }
+            for (const auto& kv : occ_agg_) {
+                auto it = occ_state_.find(kv.first);
+                if (it == occ_state_.end()) continue;
+                if (kv.second & 2) it->second.big = kOccBigKeep;
+                else if (it->second.big) it->second.big--;
+                if ((kv.second & 1) || it->second.veto) {
+                    if ((kv.second & 1) && it->second.hidden >= kOccHiddenTests) {
+                        occ_woke_++;
+                        if (it->second.flaps < 3) it->second.flaps++;
+                        OccPullNeighbours(it->second, kv.first);
+                    }
+                    it->second.hidden = 0;
+                    it->second.veto = false;
+                } else if (it->second.hidden < 255) {
+                    it->second.hidden++;
+                    if (it->second.hidden >= 12) it->second.flaps = 0;  // hidden for a long time: really hidden
+                }
+            }
+        }
+        sl.occ_keys.clear();
+        sl.occ_area.clear();
+    }
+    // Once per frame (skip_hidden 3): reads the queries of the submissions the GPU has already finished instead of
+    // waiting until their slot is reused, which is ~2 frames later. Nothing else of the slot is touched (its fence is
+    // reset and the slot freed by NextSlot as before; its CollectOcclusion call then finds nothing left to read).
+    void PollOcclusion() {
+        for (Slot& sl : slots_) {
+            if (!sl.pending || sl.submits_done.load(std::memory_order_acquire) != sl.submits_queued) continue;
+            if (sl.occ_used == 0 && sl.seq <= occ_done_seq_) continue;
+            if (vkGetFenceStatus(device_, sl.fence) != VK_SUCCESS) continue;
+            CollectOcclusion(sl);
+        }
+    }
+    std::vector<uint64_t> occ_results_;
+    std::unordered_map<uint64_t, uint8_t> occ_agg_;  // CollectOcclusion: key -> bit 0: any draw of it produced samples, bit 1: a large share of the target
+    std::unordered_set<int> unsupported_logged_;  // NVN formats already reported as having no Vulkan format
+    // Is this draw one that skip_hidden may judge? Only opaque world geometry: indexed triangles (lists or strips), depth tested, written
+    // to a colour or depth target of at least 256 pixels. Anything that writes nothing (the game's own visibility tests),
+    // blends (effects) or uses stencil is always drawn.
+    // skip_hidden = 2 (extended) also judges non-indexed draws, every primitive type, depth targets from 128 pixels wide
+    // and blended draws (they still need a depth test, and never a shader depth test or stencil).
+    bool OccCandidate(const DrawParams& p, const std::vector<Image*>& colors, const Image* depth, bool shader_depth_test) {
+        const bool ext = dsr::GetRuntime().config.skip_hidden >= 2;  // 2 and 3
+        int why = -1;
+        if (shader_depth_test) why = 0;
+        else if (p.index_type < 0 && !ext) why = 1;
+        else if (!ext && ((p.mode != 4 && p.mode != 5) || p.count < 3)) why = 2;  // triangle lists and strips (most world draws are strips)
+        else if (ext && p.count < 1) why = 2;
+        else if (!depth || depth->width < (ext ? 128 : 256)) why = 3;
+        else if (!st_.depth.depth_test) why = 4;
+        else if (st_.depth.stencil_test) why = 5;
+        else if (st_.color.blend_enable != 0 && !ext) why = 6;
+        else if (!(st_.depth.depth_write || (!colors.empty() && colors[0] && (st_.channel.mask & 0xF) != 0))) why = 7;
+        if (why >= 0) {
+            occ_reject_[why]++;
+            return false;
+        }
+        return true;
+    }
+    // 0: draw, 1: draw with a query, 2: leave out.
+    // `soft`: a blended draw (extended mode): one more hidden test before it is left out, so an effect that flickers
+    // in and out is not dropped on a single empty frame.
+    int OccDecide(uint64_t key, bool soft = false, uint64_t cst = 0) {
+        if (occ_state_.size() > 40000) occ_state_.clear();  // keys that never repeat (moving camera data): start over
+        OccState& s = occ_state_[key];
+        if (s.last_seen != occ_frame_) occ_order_.push_back(key);
+        s.last_seen = occ_frame_;
+        if (cst && s.cst_frame != occ_frame_) {  // first draw of this key this frame: did its constants change?
+            if (s.cst && s.cst_frame + 1 == occ_frame_) {
+                occ_seen_++;
+                if (s.cst != cst) occ_moved_++;
+            }
+            s.cst = cst;
+            s.cst_frame = occ_frame_;
+        }
+        const bool adapt = dsr::GetRuntime().config.skip_hidden >= 3;
+        const uint32_t need = kOccHiddenTests + (soft ? 1 : 0) + (adapt ? std::min<uint32_t>(s.flaps, 2) : 0);
+        if (s.hidden >= need) {
+            // Hidden draws are re-tested on staggered frames (by key) rather than all on the same one: with every
+            // draw retested together, one frame in kOccRetest drew all the hidden geometry again (a periodic spike).
+            // Every draw sharing this key (several objects with the same mesh) is retested on the frame the key is
+            // retested: the first one used to mark the key as tested, so the others stayed out of the frame, and an
+            // instance that had come into view stayed missing while the first one was still hidden.
+            if (s.last_test == occ_frame_) return 1;
+            const bool l3 = dsr::GetRuntime().config.skip_hidden >= 3;
+            if (l3 && s.big) {  // covered a large part of its target lately: always drawn, with a query so that this can expire
+                s.last_test = occ_frame_;
+                occ_big_++;
+                return 1;
+            }
+            if (l3 && s.force) {  // a neighbour in the draw order has just come back into view: retest together with it
+                s.force = false;
+                s.last_test = occ_frame_;
+                s.test_seq = submit_seq_ + 1;
+                return 1;
+            }
+            // skip_hidden = 3: the retest's result is not known yet, so the draw stays in (no query) until it is.
+            if (l3 && s.test_seq > occ_done_seq_) {
+                s.kept_frame = occ_frame_;
+                occ_kept_++;
+                return 0;
+            }
+            uint32_t retest = kOccRetest;
+            if (l3) {
+                // The longer a draw has stayed hidden, the less often it is retested. Each retest now costs the frames
+                // until its result is in, so the intervals are longer than the 3 frames of levels 1 and 2: a draw that
+                // has just gone hidden (likely to be back: screen edges, animation) is retested sooner than one that
+                // has been hidden for a long time, and while the view moves nothing waits more than 8 frames.
+                const uint32_t extra = s.hidden - need;  // retests that found nothing
+                const bool still = !occ_moving_ && occ_still_ >= kOccStillFrames;
+                if (s.flaps) retest = still ? 4 : 2;  // at the edge of what is visible: it has come back before
+                else if (still) retest = extra >= 4 ? 12 : extra >= 2 ? 9 : 6;
+                else retest = extra >= 4 ? 6 : extra >= 2 ? 5 : 3;  // the view moves: nothing waits more than 6 frames
+            }
+            const uint32_t since = occ_frame_ - std::max(s.last_test, s.kept_frame);
+            if (since < retest || (occ_frame_ + uint32_t(key >> 7)) % retest != 0) return 2;
+            s.last_test = occ_frame_;
+            if (l3) s.test_seq = submit_seq_ + 1;  // the submission this frame's draws go into
+            return 1;
+        }
+        s.last_test = occ_frame_;
+        return 1;
     }
 
     // Submits the current slot's commands and moves to the other slot. The CPU waits only if that slot's
@@ -3122,6 +4018,7 @@ private:
             if (r != VK_SUCCESS) LogOnce("fence", "GPU did not finish within 5 s (%d)", r);
             DeliverReadbacks(sl);
             CollectGpuTime(sl);
+            CollectOcclusion(sl);
             vkResetFences(device_, 1, &sl.fence);
             sl.pending = false;
             completed_seq_ = std::max(completed_seq_, sl.seq);  // one queue: earlier submissions are done too
@@ -3142,6 +4039,7 @@ private:
             if (sl.pending) {
                 DeliverReadbacks(sl);
                 CollectGpuTime(sl);
+                CollectOcclusion(sl);
                 vkResetFences(device_, 1, &sl.fence);
                 sl.pending = false;
             }
@@ -3239,6 +4137,17 @@ private:
     // ======================================================================================================
     // clears / copies
     // ======================================================================================================
+    // A pending clear that a new clear of the same aspect, layer and level replaces before anything has used the
+    // image (any use consumes it: a pass loads it, a read or copy flushes it) never has to run: dropping it saves
+    // a render pass break and a separate clear. The skipped passes' targets are zeroed again after every real
+    // draw on them, so this was a large share of the "performed separately" clears (log of 2026-11-19).
+    bool DeadClear(const Image& img, VkImageAspectFlags aspect, int layer, int level) {
+        if (!img.clear_pending || img.clear_aspect != aspect || img.clear_layer != layer || img.clear_level != level)
+            return false;
+        clears_dropped_++;
+        return true;
+    }
+    uint64_t clears_dropped_ = 0;
     // Performs a deferred clear (outside a render pass).
     void FlushClear(Image& img) {
         img.clear_pending = false;
@@ -3303,7 +4212,14 @@ private:
         if (st_.rts.size() <= size_t(st_.num_rt)) return;
         Image* img = GetImage(st_.rts[size_t(st_.num_rt)], false);
         if (!img) return;
-        depth_gen_++;
+        // shadow_quality 0: nothing is drawn into the shadow map and the sampler answers "lit" whatever it holds, so
+        // the game's clear of it each frame is pointless. Left pending it made the next draw that samples the map
+        // end the open world pass (a full-frame store and reload on a tiling GPU) to flush a clear and transition
+        // the map ("fmt 54 512x512 from layout 5" in the log, once per frame).
+        if (dsr::GetRuntime().config.shadow_quality == 0 && !shadow_maps_.empty() &&
+            shadow_maps_.count(ShadowMapKey(*img)))
+            return;
+        img->content_gen = ++depth_gen_;
         VkImageAspectFlags a = 0;
         if (c.depth_mask && HasDepth(img->nvn_format)) a |= VK_IMAGE_ASPECT_DEPTH_BIT;
         if (c.stencil_mask && HasStencil(img->nvn_format)) a |= VK_IMAGE_ASPECT_STENCIL_BIT;
@@ -3321,7 +4237,7 @@ private:
                 clears_in_pass_++;
             } else {
                 if (InOpenPass(img)) EndRendering();
-                if (img->clear_pending) FlushClear(*img);
+                if (img->clear_pending && !DeadClear(*img, a, rr.layer, rr.level)) FlushClear(*img);
                 img->clear_pending = true;
                 img->clear_value = v;
                 img->clear_aspect = a;
@@ -3346,6 +4262,7 @@ private:
     }
 
     void CopyImage(Image& src, const CopyRegion& sr, Image& dst, const CopyRegion& dr, int flags) {
+        dst.skip_zeroed = false;  // written by a copy: no longer the skipped pass's zero
         if (IsDepthFormat(src.nvn_format) != IsDepthFormat(dst.nvn_format)) return;
         auto clampw = [](int v, int def) { return v > 0 ? v : def; };
         int sw = clampw(sr.width, src.width), sh = clampw(sr.height, src.height);
@@ -3639,6 +4556,8 @@ private:
             });
             rendering_ = false;
             pass_breaks_[line]++;
+            last_end_key_ = rendering_key_;  // resumed_same_: a pass that restarts on the same targets
+            last_end_line_ = line;
             if (mali_barriers_)
                 for (size_t i = 0; i < pass_color_count_; i++) {
                     Image* c = pass_colors_[i];
@@ -3694,7 +4613,8 @@ private:
         *extent = {w, h};
         if (rendering_ && key == rendering_key_) return true;
         EndRendering();
-        if (depth && depth->depth_exported && dsr::GetRuntime().config.lrz_workaround) LrzTouch(*depth);
+        // LRZ is an Adreno feature: on Mali the refresh only adds two copies and a render pass break per depth buffer.
+        if (depth && depth->depth_exported && dsr::GetRuntime().config.lrz_workaround && !gpu_mali_) LrzTouch(*depth);
         // An image the previous pass rendered to, used again here in the same layout, gets no layout transition
         // and so had no barrier: without one the GPU may run the passes overlapped. On tiled GPUs (Adreno) a
         // bin of this pass then loads the image before the earlier pass stored that bin, and whatever it drew
@@ -3805,6 +4725,8 @@ private:
         pass_depth_ = depth;
         pass_extent_ = {w, h};
         render_passes_++;
+        if (!last_end_key_.empty() && key == last_end_key_) resumed_same_[last_end_line_]++;
+        last_end_key_.clear();
         rendering_ = true;
         rendering_key_ = key;
         return true;
@@ -3813,6 +4735,194 @@ private:
     // ======================================================================================================
     // shaders, layouts, pipelines
     // ======================================================================================================
+    // ---- persistent shader cache and warm-up ------------------------------------------------------------------
+    // Guest shaders are translated once. The translation (SPIR-V and shader info) is kept in
+    // cache/shader_cache.bin, keyed by the guest code's hash and the translation options, so it is the same on
+    // every run. Each translated shader's code and options are also kept in cache/shader_warm.bin; on the next
+    // start, WarmupShaders() translates the ones the disk cache lacks, before the game starts, so the game does not
+    // stop to translate them. Bump the versions when the translator's output or these layouts change.
+    static constexpr uint32_t kShaderCacheVersion = 1, kWarmVersion = 1;
+    struct CachedShader {
+        std::vector<uint32_t> spirv;
+        shader::ShaderInfo info;
+    };
+    std::unordered_map<std::vector<uint32_t>, CachedShader, VecHash> shader_disk_;
+    std::unordered_map<std::vector<uint32_t>, int, VecHash> warm_seen_;
+    bool shader_cache_writable_ = false;
+    uint64_t shader_cache_hits_ = 0, shader_cache_misses_ = 0;
+    struct WarmRec {
+        std::vector<uint32_t> key;
+        shader::TranslateOptions opt;
+        std::vector<uint8_t> code;
+    };
+
+    std::string CacheFile(const char* name) const {
+        const std::string& dir = dsr::GetRuntime().config.cache_dir;
+        return dir.empty() ? std::string() : dir + "/" + name;
+    }
+    static void WriteShaderRecord(FILE* f, const std::vector<uint32_t>& key, const std::vector<uint32_t>& spirv,
+                                  const shader::ShaderInfo& info) {
+        const uint32_t nwords = uint32_t(spirv.size()), info_size = uint32_t(sizeof(info));
+        fwrite(key.data(), 4, key.size(), f);
+        fwrite(&nwords, 4, 1, f);
+        fwrite(&info_size, 4, 1, f);
+        fwrite(&info, sizeof(info), 1, f);
+        fwrite(spirv.data(), 4, spirv.size(), f);
+    }
+    void RewriteShaderCache(const std::string& path) {
+        FILE* f = fopen(path.c_str(), "wb");
+        if (!f) {
+            shader_cache_writable_ = false;
+            return;
+        }
+        const char magic[8] = {'D', 'S', 'R', 'S', 'C', '0', '1', 0};
+        fwrite(magic, 1, 8, f);
+        fwrite(&kShaderCacheVersion, 4, 1, f);
+        for (const auto& e : shader_disk_) WriteShaderRecord(f, e.first, e.second.spirv, e.second.info);
+        fclose(f);
+        shader_cache_writable_ = true;
+    }
+    void LoadShaderCache() {
+        static_assert(std::is_trivially_copyable<shader::ShaderInfo>::value, "ShaderInfo must be plain data");
+        const std::string path = CacheFile("shader_cache.bin");
+        if (path.empty()) return;
+        const char magic[8] = {'D', 'S', 'R', 'S', 'C', '0', '1', 0};
+        bool damaged = true;
+        if (FILE* f = fopen(path.c_str(), "rb")) {
+            char m[8];
+            uint32_t ver = 0;
+            if (fread(m, 1, 8, f) == 8 && memcmp(m, magic, 8) == 0 && fread(&ver, 4, 1, f) == 1 &&
+                ver == kShaderCacheVersion) {
+                damaged = false;
+                for (;;) {
+                    uint32_t key[6], nwords = 0, info_size = 0;
+                    if (fread(key, 4, 6, f) != 6) break;  // clean end of file
+                    if (fread(&nwords, 4, 1, f) != 1 || fread(&info_size, 4, 1, f) != 1) {
+                        damaged = true;
+                        break;
+                    }
+                    CachedShader c;
+                    if (info_size != sizeof(c.info) || nwords == 0 || nwords > (1u << 22)) {
+                        damaged = true;
+                        break;
+                    }
+                    c.spirv.resize(nwords);
+                    if (fread(&c.info, sizeof(c.info), 1, f) != 1 || fread(c.spirv.data(), 4, nwords, f) != nwords) {
+                        damaged = true;
+                        break;
+                    }
+                    shader_disk_.emplace(std::vector<uint32_t>(key, key + 6), std::move(c));
+                }
+            }
+            fclose(f);
+        }
+        if (damaged) {
+            shader_disk_.clear();  // missing, another version or damaged: start a fresh file
+            RewriteShaderCache(path);
+        } else {
+            shader_cache_writable_ = true;
+        }
+        LOGI(kTag, "shader cache: %zu translated shaders loaded", shader_disk_.size());
+    }
+    void AppendShaderCache(const std::vector<uint32_t>& key, const shader::TranslateResult& r) {
+        if (!shader_cache_writable_) return;
+        if (FILE* f = fopen(CacheFile("shader_cache.bin").c_str(), "ab")) {
+            WriteShaderRecord(f, key, r.spirv, r.info);
+            fclose(f);
+        }
+    }
+    // Shaders translated in this run: their code and options, for the warm-up of the next start.
+    void RememberForWarmup(const ShaderCode& code, const shader::TranslateOptions& opt, const std::vector<uint32_t>& key) {
+        static_assert(std::is_trivially_copyable<shader::TranslateOptions>::value, "options are stored as bytes");
+        if (!warm_seen_.emplace(key, 1).second) return;
+        const std::string path = CacheFile("shader_warm.bin");
+        FILE* f = path.empty() ? nullptr : fopen(path.c_str(), "ab");
+        if (!f) return;
+        if (ftell(f) == 0) {
+            const char magic[8] = {'D', 'S', 'R', 'W', 'U', '0', '1', 0};
+            fwrite(magic, 1, 8, f);
+            fwrite(&kWarmVersion, 4, 1, f);
+        }
+        const uint32_t opt_size = uint32_t(sizeof(opt)), code_size = uint32_t(code.code.size());
+        fwrite(key.data(), 4, key.size(), f);
+        fwrite(&opt_size, 4, 1, f);
+        fwrite(&code_size, 4, 1, f);
+        fwrite(&opt, sizeof(opt), 1, f);
+        fwrite(code.code.data(), 1, code.code.size(), f);
+        fclose(f);
+    }
+    std::vector<WarmRec> ReadWarm() {
+        std::vector<WarmRec> out;
+        const std::string path = CacheFile("shader_warm.bin");
+        FILE* f = path.empty() ? nullptr : fopen(path.c_str(), "rb");
+        if (!f) return out;
+        const char magic[8] = {'D', 'S', 'R', 'W', 'U', '0', '1', 0};
+        char m[8];
+        uint32_t ver = 0;
+        if (fread(m, 1, 8, f) == 8 && memcmp(m, magic, 8) == 0 && fread(&ver, 4, 1, f) == 1 && ver == kWarmVersion) {
+            for (;;) {
+                uint32_t k[6], opt_size = 0, code_size = 0;
+                if (fread(k, 4, 6, f) != 6) break;
+                if (fread(&opt_size, 4, 1, f) != 1 || fread(&code_size, 4, 1, f) != 1) break;
+                WarmRec w;
+                w.key.assign(k, k + 6);
+                if (opt_size != sizeof(w.opt) || code_size == 0 || code_size > (1u << 24)) break;  // another version
+                if (fread(&w.opt, sizeof(w.opt), 1, f) != 1) break;
+                w.code.resize(code_size);
+                if (fread(w.code.data(), 1, code_size, f) != code_size) break;
+                warm_seen_.emplace(w.key, 1);
+                out.push_back(std::move(w));
+            }
+        }
+        fclose(f);
+        return out;
+    }
+    // Before the game starts: translates the recorded shaders that the disk cache does not have (at most 30 s).
+    // Warm-up runs a little at a time, once per presented frame (WarmupStep), so the screen keeps moving; the
+    // progress is drawn on the screen until the recorded shaders are all checked.
+    std::vector<WarmRec> warm_recs_;
+    size_t warm_pos_ = 0;
+    std::atomic<int> warm_permille_{-1};  // -1: nothing to show; 0..1000: progress drawn on the screen
+    std::chrono::steady_clock::time_point warm_t0_;
+    uint64_t total_warm_translated_ = 0;
+
+    void WarmupShaders() {
+        warm_recs_ = ReadWarm();
+        warm_pos_ = 0;
+        if (warm_recs_.empty()) return;
+        warm_t0_ = std::chrono::steady_clock::now();
+        warm_permille_.store(0);
+        LOGI(kTag, "warm-up: %zu recorded shaders to check before the game is shown", warm_recs_.size());
+    }
+    void WarmupStep(double budget_ms) {
+        if (warm_permille_.load() < 0) return;
+        const auto t0 = std::chrono::steady_clock::now();
+        while (warm_pos_ < warm_recs_.size()) {
+            const WarmRec& w = warm_recs_[warm_pos_++];
+            if (!shader_disk_.count(w.key)) {
+                shader::TranslateResult r = shader::Translate(w.code.data(), w.code.size(), w.opt);
+                if (r.ok) {
+                    shader_disk_[w.key] = CachedShader{r.spirv, r.info};
+                    AppendShaderCache(w.key, r);
+                    total_warm_translated_++;
+                }
+            }
+            if (std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() > budget_ms)
+                break;
+        }
+        if (warm_pos_ >= warm_recs_.size()) {
+            const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - warm_t0_).count();
+            LOGI(kTag, "warm-up: done, %llu shaders translated before the game (%.1f s)",
+                 (unsigned long long)total_warm_translated_, secs);
+            warm_permille_.store(-1);
+            warm_recs_.clear();
+            warm_recs_.shrink_to_fit();
+        } else {
+            warm_permille_.store(int(warm_pos_ * 1000 / warm_recs_.size()));
+        }
+    }
+
+
     Shader* GetShader(const ShaderCode& code, const shader::TranslateOptions& opt) {
         const uint32_t parts[6] = {uint32_t(code.hash), uint32_t(code.hash >> 32), opt.int_attrib_mask,
                                    opt.signed_attrib_mask, uint32_t(opt.gl_depth_range),
@@ -3829,7 +4939,22 @@ private:
             return &it->second;
         }
         Shader& s = shaders_[key];
-        shader::TranslateResult r = shader::Translate(code.code.data(), code.code.size(), opt);
+        shader::TranslateResult r;
+        const auto disk = shader_disk_.find(key);
+        if (disk != shader_disk_.end()) {
+            r.ok = true;
+            r.spirv = disk->second.spirv;
+            r.info = disk->second.info;
+            shader_cache_hits_++;
+        } else {
+            r = shader::Translate(code.code.data(), code.code.size(), opt);
+            shader_cache_misses_++;
+            if (r.ok) {
+                shader_disk_[key] = CachedShader{r.spirv, r.info};
+                AppendShaderCache(key, r);
+                RememberForWarmup(code, opt, key);
+            }
+        }
         if (!r.ok) {
             s.error = r.error;
             if (shader_failures_logged_++ < 24)
@@ -3994,11 +5119,11 @@ private:
             snap = CreateImage(snap_ref);
         if (!snap) return nullptr;
         auto& gen = snapshot_gen_[snap_ref.addr];
-        if (gen != depth_gen_ + 1) {
+        if (gen != depth.content_gen + 1) {
             EndRendering();
             CopyImage(depth, CopyRegion{}, *snap, CopyRegion{}, 0);
             snap->written = true;
-            gen = depth_gen_ + 1;
+            gen = depth.content_gen + 1;
             Transition(depth, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
         }
         if (snap->layout != VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
@@ -4010,8 +5135,8 @@ private:
 
     // 1x1 stand-in of a dimension: white (missing textures) or opaque black (`black`: placeholders of the wrong
     // dimension, like the game's 16x16 black texture bound where a cube map is sampled).
-    Image* Fallback(shader::TexDim dim, bool array, bool black = false) {
-        const int key = int(dim) * 2 + (array ? 1 : 0) + (black ? 64 : 0);
+    Image* Fallback(shader::TexDim dim, bool array, bool black = false, bool alpha0 = false) {
+        const int key = int(dim) * 2 + (array ? 1 : 0) + (black ? 64 : 0) + (alpha0 ? 128 : 0);
         auto it = fallbacks_.find(key);
         if (it != fallbacks_.end()) return it->second;
         TexRef t;
@@ -4032,7 +5157,7 @@ private:
             Transition(*img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
             VkClearColorValue white;
             white.float32[0] = white.float32[1] = white.float32[2] = black ? 0.0f : 1.0f;
-            white.float32[3] = 1.0f;
+            white.float32[3] = alpha0 ? 0.0f : 1.0f;
             VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, uint32_t(img->layers)};
             Rec([white, range, image = img->image](VkCommandBuffer cb) {
                 vkCmdClearColorImage(cb, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &white, 1, &range);
@@ -4113,6 +5238,52 @@ private:
     std::vector<uint64_t> scratch_rendering_key_;
     VertexInput scratch_vin_;
 
+    // The draw's identity across frames (false: not trackable). The first 128 bytes of the vertex constants hold the
+    // camera, so only the part after them (the object's transforms) goes in.
+    bool OccKey(const DrawParams& p, const VertexInput& vin, uint32_t target_w, uint64_t* out, uint64_t* cst_out = nullptr) {
+        if (!st_.program[0] || vin.bindings.empty()) {
+            occ_reject_[8]++;
+            return false;
+        }
+        const BufferRange& c3 = st_.uniforms[0][0];
+        constexpr uint64_t kFrom = 128, kLen = 96;
+        if (!c3.address || c3.size < kFrom + kLen || !GuestRangeValid(c3.address + kFrom, size_t(kLen))) {
+            occ_reject_[9]++;
+            return false;
+        }
+        uint64_t h = 1469598103934665603ull;
+        const auto mix = [&h](uint64_t v) {
+            h ^= v;
+            h *= 1099511628211ull;
+            h ^= h >> 29;
+        };
+        mix(st_.program[0]->hash);
+        mix(st_.program[1] ? st_.program[1]->hash : 0);
+        mix(uint64_t(p.count) | (uint64_t(p.index_type) << 40) | (uint64_t(st_.depth.depth_write) << 48));
+        mix(p.index_address);
+        mix(uint64_t(int64_t(p.base_vertex)));
+        mix(uint64_t(uint32_t(p.mode)) | (uint64_t(st_.color.blend_enable != 0) << 8));  // type and blending (extended mode)
+        if (p.index_type < 0) mix(uint64_t(int64_t(p.first)));  // non-indexed: the range is what tells draws apart
+        mix(st_.vertex_buffers[vin.bindings[0].binding].address);
+        mix(uint64_t(target_w));
+        // The object's constants are not part of the key: while the camera moves they change every frame (tracked draws
+        // went from ~2000 standing still to 20-40k moving, and almost nothing was ever left out). Objects sharing a
+        // mesh share a key instead; CollectOcclusion treats the key as hidden only if none of them was visible.
+        *out = h;
+        if (cst_out) {  // the object's constants (not part of the key): only used to tell whether the view is moving
+            uint64_t ch = 1469598103934665603ull;
+            const uint64_t* w = reinterpret_cast<const uint64_t*>(c3.address + kFrom);
+            for (uint64_t i = 0; i < kLen / 8; i++) {
+                uint64_t v;
+                memcpy(&v, w + i, 8);
+                ch ^= v;
+                ch *= 1099511628211ull;
+                ch ^= ch >> 29;
+            }
+            *cst_out = ch ? ch : 1;
+        }
+        return true;
+    }
     void Draw(const DrawParams& p) {
         phase_timing_ = (drawn_ & 7) == 0;
         Phase(-1);
@@ -4149,6 +5320,25 @@ private:
                                        HasDepth(depth_peek->nvn_format) && st_.depth.depth_test && !st_.depth.depth_write &&
                                        st_.program[1] && st_.depth.depth_func != 8 && !debug_fx;
         if (shader_depth_test) fopt.depth_test_func = st_.depth.depth_func;
+        // shadow_quality 0: the shadow map pass (depth only, square target, nothing else bound) is not drawn. The
+        // lookups are answered "lit" by the sampler (see Sampler), so the map's contents do not matter.
+        // (The game sets 4 colour target slots for every pass, the shadow pass's all empty, and its alpha-tested casters
+        // have a fragment program: neither "no colour targets" nor "no fragment program" can be asked for.)
+        bool no_colour_target = true;
+        if (dsr::GetRuntime().config.shadow_quality == 0 && depth_peek)
+            for (int i = 0; i < st_.num_rt && no_colour_target; i++)
+                if (GetImage(st_.rts[size_t(i)], false)) no_colour_target = false;
+        if (dsr::GetRuntime().config.shadow_quality == 0 && no_colour_target && depth_peek &&
+            depth_peek->width == depth_peek->height && depth_peek->width >= 256 && depth_peek->width <= 2048 &&
+            IsDepthFormat(depth_peek->nvn_format))
+        {
+            if (!shadow_skip_logged_) {
+                shadow_skip_logged_ = true;
+                LOGI(kTag, "shadow_quality 0: the shadow map pass (%dx%d) is not drawn", depth_peek->width, depth_peek->height);
+            }
+            shadow_maps_.insert(ShadowMapKey(*depth_peek));  // its per-frame clear is left out too (ClearDepth)
+            return;
+        }
         Shader* vs = GetShader(*st_.program[0], vopt);
         // No pixel program: a depth-only pass (shadow maps, depth prepass). Draw with the vertex stage only.
         Shader* fs = st_.program[1] ? GetShader(*st_.program[1], fopt) : &no_fragment_;
@@ -4202,9 +5392,196 @@ private:
             while (!colors.empty() && !colors.back()) colors.pop_back();
         if (depth && !IsDepthFormat(depth->nvn_format)) depth = nullptr;
 
+        // ---- skip_fs: full-screen passes left out (bloom, depth of field...) ----------------------------------
+        // On a Mali each full-screen pass costs about the same whatever its size (a tile load and store), so a long
+        // post-processing chain is a large part of the frame. A draw whose fragment program is in the list is not
+        // drawn; the target it would have written is cleared to zero (once, until some other draw writes it) so that
+        // what samples it later (the tone mapping adding the bloom) reads black instead of whatever the memory held.
+        if (!skip_parsed_) ParseSkipList();
+        // The 3D world's target size (a colour target drawn with a depth buffer): skip_post passes are only left out
+        // on targets at most half that area, never on the full-size passes that make up the picture itself.
+        // Targets bigger than the game's presented frame are not the world (a 1024x1024 colour target drawn with a depth
+        // buffer made every world-size pass count as "small" and left out the skip_post programs that also run at
+        // full size: black parts of the picture in some places and camera angles).
+        if (depth && !colors.empty() && colors[0]) {
+            const uint64_t a = uint64_t(colors[0]->width) * uint64_t(colors[0]->height);
+            if (game_frame_area_ && world_max_area_ > game_frame_area_) world_max_area_ = 0;
+            if (a > world_max_area_ && (!game_frame_area_ || a <= game_frame_area_)) world_max_area_ = a;
+        }
+        bool post_small = false;
+        if (!skip_post_.empty() && world_max_area_ && !colors.empty() && colors[0] && st_.program[1] &&
+            skip_post_.count(st_.program[1]->hash))
+            post_small = uint64_t(colors[0]->width) * uint64_t(colors[0]->height) * 2 <= world_max_area_;
+        // A skip_post program that writes depth into a depth image some other draw samples as a texture (the half-size
+        // depth of the soft particles, fog and depth of field) is not left out: nothing would write that depth, so what
+        // reads it afterwards gets the objects missing or the previous frame's depth (ghosts). From a log with
+        // skip_post_extra = e4eb576b6a6d76cb,0fbd542ccb790473: both draw into 356x164 @..8000 with depth write on the
+        // 356x164 depth that the particle and depth-of-field passes then sample (as f54 textures) and test against.
+        // What is left out is the colour they would have written; the depth is still written (the draw goes on with every
+        // colour channel masked off, in the same render pass, so no pass is broken), which keeps what reads it right.
+        bool post_depth_only = false;
+        if (post_small && depth && st_.depth.depth_write && depth_sampled_.count(depth->addr)) {
+            if (skip_kept_logged_.insert(st_.program[1]->hash).second)
+                LOGI(kTag, "skip_post: fragment program %016llx is drawn without colour: it writes the %dx%d depth @%llx that other draws sample",
+                     (unsigned long long)st_.program[1]->hash, depth->width, depth->height,
+                     (unsigned long long)depth->addr);
+            post_small = false;
+            post_depth_only = true;
+        }
+        struct RestoreMask {
+            decltype(st_.channel.mask)* p = nullptr;
+            decltype(st_.channel.mask) v{};
+            ~RestoreMask() {
+                if (p) *p = v;
+            }
+        } restore_mask;
+        if (post_depth_only) {
+            restore_mask.p = &st_.channel.mask;
+            restore_mask.v = st_.channel.mask;
+            st_.channel.mask = 0;
+            post_depth_draws_++;
+        }
+        if ((!skip_fs_.empty() || post_small) && !colors.empty()) {
+            if (st_.program[1] && (post_small || skip_fs_.count(st_.program[1]->hash))) {
+                // A blended draw (particles, fog) only adds to what its target already holds. Leaving it out must not
+                // zero the target: that threw away the game's own clear (an "empty" value that is not always zero, so
+                // the composition turned parts of the picture black depending on the camera angle: 9a14cd3d05151bb4 in
+                // the last area) and whatever other draws had already written there. The target keeps what the game
+                // gave it; it is zeroed only when nothing has defined it yet (no clear pending, never written).
+                const bool overlay = st_.color.blend_enable != 0;
+                for (size_t i = 0; i < colors.size(); i++) {
+                    if (!colors[i]) continue;
+                    if (overlay && (colors[i]->clear_pending || colors[i]->written)) continue;
+                    ZeroSkippedTarget(*colors[i], i, skip_white_.count(st_.program[1]->hash) != 0);
+                }
+                if (dsr::GetRuntime().config.profile) SkipDiag(p, colors, depth, fs, true);
+                if (skip_logged_.insert(st_.program[1]->hash).second)
+                    LOGI(kTag, "skip_fs: fragment program %016llx is not drawn (%dx%d target)",
+                         (unsigned long long)st_.program[1]->hash, colors[0] ? colors[0]->width : 0,
+                         colors[0] ? colors[0]->height : 0);
+                skipped_draws_++;
+                return;
+            }
+            for (Image* c : colors)
+                if (c) c->skip_zeroed = false;  // a real draw writes it now
+            if (dsr::GetRuntime().config.profile && world_max_area_ && colors[0] &&
+                uint64_t(colors[0]->width) * uint64_t(colors[0]->height) * 2 <= world_max_area_)
+                SkipDiag(p, colors, depth, fs, false);
+        }
+
+        // ---- post-processing census (diagnostics) -----------------------------------------------------------------
+        if (dsr::GetRuntime().config.profile && st_.program[1] && !colors.empty() && colors[0]) {
+            const uint64_t area = uint64_t(colors[0]->width) * uint64_t(colors[0]->height);
+            if (area > census_max_area_) census_max_area_ = area;
+            if (area * 2 <= census_max_area_)
+                post_census_[{st_.program[1]->hash, uint64_t(colors[0]->width) << 16 | uint64_t(colors[0]->height)}]++;
+        }
+
+        // ---- skip_prepass (see PrepassStat) -----------------------------------------------------------------------
+        struct ForceDepthWrite {
+            bool* p = nullptr;
+            ~ForceDepthWrite() {
+                if (p) *p = false;
+            }
+        } force_depth_write;
+        // (also during frame captures: with the skips off the pass table timed a frame the game never draws)
+        if (dsr::GetRuntime().config.skip_prepass && !post_depth_only && depth && depth->width >= 256 &&
+            st_.depth.depth_test && !st_.depth.stencil_test && !shader_depth_test && (st_.depth.depth_func == 2 || st_.depth.depth_func == 4) &&
+            !(st_.program[1] && fs->info.writes_depth)) {
+            bool any_color = false;
+            for (Image* c : colors) any_color |= c != nullptr;
+            const bool colour_writes = any_color && (st_.channel.mask & 0xF) != 0;
+            const bool depth_only = !colour_writes && st_.depth.depth_write;
+            const bool main_like = colour_writes && !st_.depth.depth_write && st_.color.blend_enable == 0;
+            if (depth_only || main_like) {
+                PrepassStat& s = prepass_[depth->addr];
+                if (s.frame != occ_frame_) {
+                    s.learned = s.pre >= 16 && s.matched >= 16 && uint64_t(s.matched) * 10 >= uint64_t(s.pre) * 8;
+                    s.frame = occ_frame_;
+                    s.pre = s.main = s.matched = 0;
+                }
+                if (prepass_keys_frame_ != occ_frame_) {
+                    prepass_keys_.clear();
+                    prepass_keys_frame_ = occ_frame_;
+                }
+                const uint64_t pkey = PrepassKey(p, depth->addr);
+                if (depth_only) {
+                    s.pre++;
+                    if (prepass_keys_.size() < 8192) prepass_keys_.insert(pkey);
+                    if (s.learned) {
+                        prepass_skipped_++;
+                        skipped_draws_++;
+                        return;
+                    }
+                } else {
+                    s.main++;
+                    const bool twin = prepass_keys_.count(pkey) != 0;
+                    if (twin) s.matched++;
+                    if (s.learned) {
+                        if (twin) {
+                            st_.depth.depth_write = true;  // restored when this draw is done (ForceDepthWrite)
+                            force_depth_write.p = &st_.depth.depth_write;
+                            prepass_converted_++;
+                        } else {
+                            prepass_unmatched_++;
+                        }
+                    }
+                }
+            }
+        }
+
+        // ---- skip_hidden: world draws that covered no pixel in recent frames are left out (see OccDecide) -------
+        uint64_t occ_key = 0, occ_cst = 0;
+        bool occ_query = false;
+        if (dsr::GetRuntime().config.skip_hidden && OccCandidate(p, colors, depth, shader_depth_test) &&
+            OccKey(p, vin, uint32_t(depth->width), &occ_key,
+                   dsr::GetRuntime().config.skip_hidden >= 3 ? &occ_cst : nullptr)) {
+            occ_judged_++;
+            const int act = OccDecide(occ_key, st_.color.blend_enable != 0, occ_cst);
+            if (act == 2) {
+                occ_skipped_++;
+                if (post_depth_only) post_depth_hidden_++;
+                return;
+            }
+            // A frame capture records no visibility queries (it uses the pool for its own sample counts): such a draw
+            // is drawn as it is, without vetoing its key.
+            occ_query = act == 1 && !capture_active_;
+        }
+
         Begin();
         // Keep enough streaming space for this draw so nothing allocated below is lost to a flush.
         if (StreamRemaining() < (16ull << 20)) Flush();
+
+        // ---- hud_full_res: the game's HUD and menus drawn at the screen's resolution -------------------------
+        // The game draws its HUD (blended 2D draws) on a target of its frame size (`T`), and a final pass then turns T
+        // into the frame it presents. The first HUD draw on T enlarges the 3D picture made so far into a screen-sized
+        // image (hud_img_); that draw and every later one on T go into that image instead, with their viewport and
+        // scissor scaled. The final pass then reads hud_img_ instead of T and renders into a second screen-sized
+        // image (hud2_img_), which Present shows. A T that is presented as it is needs no final pass. A T is only
+        // redirected once a frame has shown how it reaches the screen (hud_sources_); anything else stays as it was.
+        bool hud_redirect = false, hud_boxed = false, samples_t = false, sampled_cand = false;
+        if (hud_w_ > 0 && !colors.empty() && colors[0] && HudTarget(colors, depth)) {
+            Image* f = colors[0];
+            const int cls = HudClass(p, vin);
+            if (cls && !hud_started_ && !hud_sources_.count(f->addr)) {
+                // A HUD draw on a target not known yet: it is a source if the game presents it as it is, or if a
+                // later draw of the frame reads it to make a presented frame (the final pass, see below).
+                hud_cand_addr_ = f->addr;
+                if (presented_addrs_.count(f->addr)) hud_sources_.insert(f->addr);
+            }
+            if (hud_sources_.count(f->addr)) {
+                if (!hud_started_ && cls) {
+                    hud_started_ = HudStart(*f);
+                    if (!hud_started_) hud_w_ = 0;  // could not make the image: the rest of this frame is drawn as before
+                }
+                if (hud_started_ && hud_t_addr_ == f->addr) {
+                    hud_redirect = true;
+                    hud_boxed = cls == 1 && hud_box_w_ > 0;
+                    colors[0] = &hud_img_;
+                    hud_redirected_++;
+                }
+            }
+        }
 
         Phase(1);
         // ---- textures (uploads and layout changes happen outside rendering) ---------------------------------
@@ -4217,6 +5594,7 @@ private:
                 if (!plain && !shadow) continue;
                 BoundTexture bt = st_.textures[stage][slot];
                 Image* img = nullptr;
+                bool zero_standin = false;
                 if (shader_depth_test && stage == 1 && slot == 31 && depth) {
                     // The depth copy the shader tests against (TranslateOptions::depth_test_func).
                     bt = BoundTexture{};
@@ -4231,10 +5609,16 @@ private:
                     img = bt.valid ? GetImage(bt.texture, true) : nullptr;
                 }
                 if (!img) {
-                    // Missing or unsupported texture: draw with a white stand-in rather than dropping the
-                    // draw (one skipped pass can blank the whole frame).
-                    Skip(bt.valid ? "texture format not supported (white stand-in used)"
-                                  : "texture handle not found (white stand-in used)");
+                    // Missing, still converting or unsupported texture: draw with a white stand-in rather than
+                    // dropping the draw (one skipped pass can blank the whole frame).
+                    const Image* conv = bt.valid ? FindImage(bt.texture) : nullptr;
+                    const bool converting = conv && conv->pending && !conv->written;
+                    if (bt.valid && !converting && unsupported_logged_.insert(bt.texture.tex.format).second)
+                        LOGW(kTag, "texture of NVN format %d (%dx%d, %d levels) has no usable Vulkan format: white stand-in used",
+                             bt.texture.tex.format, bt.texture.tex.width, bt.texture.tex.height, bt.texture.tex.levels);
+                    Skip(converting ? "texture still converting in the background (white stand-in used)"
+                         : bt.valid ? "texture format not supported (white stand-in used)"
+                                    : "texture handle not found (white stand-in used)");
                     img = Fallback(info.texture_dim[slot], info.texture_array[slot]);
                     bt.texture.tex.swizzle[0] = 2;
                     bt.texture.tex.swizzle[1] = 3;
@@ -4242,6 +5626,14 @@ private:
                     bt.texture.tex.swizzle[3] = 5;
                     if (!img) return Skip("no stand-in texture");
                 }
+                // hud_full_res: what the game reads as this frame's picture is the enlarged one with the HUD on it.
+                if (hud_started_ && img->addr == hud_t_addr_ && img != &hud_img_ && img != &hud2_img_) {
+                    img = &hud_img_;
+                    samples_t = true;
+                } else if (hud_cand_addr_ && !hud_started_ && img->addr == hud_cand_addr_) {
+                    sampled_cand = true;
+                }
+                if (IsDepthFormat(img->nvn_format)) depth_sampled_.insert(img->addr);  // (see skip_post_)
                 for (Image* c : colors)
                     if (c == img) return Skip("texture is also a render target");
                 if (img != depth && IsDepthFormat(img->nvn_format) && (dsr::GetRuntime().config.hole_test & 16)) {
@@ -4254,6 +5646,25 @@ private:
                     // Sampling the bound depth buffer (soft particles, fog): read a snapshot copy instead.
                     img = DepthSnapshot(*depth, st_.rts[size_t(st_.num_rt)]);
                     if (!img) return Skip("texture is also the depth target");
+                }
+                // skip_fs: what a skipped pass would have written still holds the zero clear (nothing has written
+                // it since: the flag is reset by every real draw, clear and copy). Reading it as it is meant ending
+                // the open render pass, a transition and a separate clear for a texture that is all zeros; a 1x1
+                // transparent black stand-in reads the same and costs none of that.
+                if (img->skip_zeroed && img->written && img->levels == 1 && img->layers == 1 &&
+                    img->type == VK_IMAGE_TYPE_2D && !IsDepthFormat(img->nvn_format) && img != depth &&
+                    img != &hud_img_ && img != &hud2_img_ && info.texture_dim[slot] == shader::TexDim::D2 &&
+                    !info.texture_array[slot] && !capture_active_) {
+                    // the alpha of formats without alpha is read as one, as for the image itself
+                    // skip_white: the target was filled with white, so is the stand-in (opaque white)
+                    Image* z = img->skip_fill_white
+                                   ? Fallback(info.texture_dim[slot], false, false, false)
+                                   : Fallback(info.texture_dim[slot], false, true, !IgnoresAlpha(img->nvn_format));
+                    if (z) {
+                        img = z;
+                        zero_standin = true;
+                        zero_standins_++;
+                    }
                 }
                 if (stage == 0 && img->frag_only_sync && img->layout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL &&
                     !img->clear_pending) {  // mali_barriers: released to fragment shaders only
@@ -4298,7 +5709,7 @@ private:
                     draw_images_.push_back({int(stage), int(slot), img});
                 }
                 VkImageView view = SampledView(*img, info.texture_dim[slot], info.texture_array[slot], swz,
-                                               bt.valid ? &bt.texture : nullptr);
+                                               bt.valid && !zero_standin ? &bt.texture : nullptr);
                 if (!view) {
                     char k[160];
                     snprintf(k, sizeof(k), "view: shader %s%d dim %d array %d | image type %d %dx%dx%d layers %d fmt %d",
@@ -4328,6 +5739,23 @@ private:
                                                                          Filterable(*img)),
                                            view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}});
             }
+        }
+
+        // hud_full_res, the frame's final pass: the draw that reads the HUD's target and renders to a frame the game
+        // presents. Learned the first time (the HUD target is then a source from the next frame on); with the HUD
+        // started, the pass reads the enlarged picture (above) and renders into a second screen-sized image.
+        bool hud_final_pending = false;
+        if (sampled_cand && !colors.empty() && colors[0] && presented_addrs_.count(colors[0]->addr) &&
+            colors[0]->width == hud_src_w_ && colors[0]->height == hud_src_h_ && hud_sources_.insert(hud_cand_addr_).second)
+            LOGI(kTag, "hud_full_res: the HUD's target @%llx is turned into the presented frame @%llx by a final pass: "
+                 "the HUD is drawn at full resolution from now on", (unsigned long long)hud_cand_addr_,
+                 (unsigned long long)colors[0]->addr);
+        if (samples_t && hud_w_ > 0 && !colors.empty() && colors[0] && !hud_redirect && HudTarget(colors, depth) &&
+            presented_addrs_.count(colors[0]->addr) && HudEnsureImage(hud2_img_, *colors[0])) {
+            hud_final_pending = hud_redirect = true;
+            hud_boxed = false;
+            colors[0] = &hud2_img_;
+            if (!hud_final_) hud2_img_.written = false;  // the pass covers all of it: nothing to load
         }
 
         // Storage images the fragment shader writes (SUST). Kept in GENERAL layout while bound.
@@ -4681,23 +6109,28 @@ private:
         Phase(5);
         // ---- queue the draw: the recorder thread builds its descriptor sets and records it --------------------
         if (!EnsureRendering(colors, depth, &extent)) return Skip("no render target");
+        if (hud_final_pending) hud_final_ = true;
         if (depth && fs->info.writes_depth && st_.depth.depth_write) depth->depth_exported = depth->fragdepth_written = true;
         DrawPacket d;
         d.pipeline = pipeline;
         d.layout = layout;
         d.set_layouts[0] = vsl;
         d.set_layouts[1] = fsl;
-        DynamicState(extent, modes, &d.dyn);
+        // Redirected HUD draws are laid out in the game's frame (hud_src_w_ x hud_src_h_) and scaled up afterwards.
+        const int ew = hud_redirect ? hud_src_w_ : int(extent.width), eh = hud_redirect ? hud_src_h_ : int(extent.height);
+        DynamicState(hud_redirect ? VkExtent2D{uint32_t(ew), uint32_t(eh)} : extent, modes, &d.dyn);
         // Other aspect ratios (aspect_ratio): the game lays its HUD and menus out for 1280x720 and stretches that
         // over the whole (wider or narrower) frame. Every draw made with that 1280x720 2D projection (several
         // shaders: quads, text, bars) goes into a centred 16:9 box instead: 1280x720 in the middle of wider frames,
         // the full width and 9/16 of it high on narrower ones, so the HUD keeps its shape and layout. Full-screen
         // quads (fades, dimming behind menus) still cover the whole frame.
-        if (hud_box_w_ && int(extent.height) == dsr::GetRuntime().config.render_height &&
-            int(extent.width) == dsr::GetRuntime().config.render_width && HudBoxed(p, vin)) {
-            const int fh = int(extent.height);
-            const float sx = float(hud_box_w_) / float(extent.width), sy = float(hud_box_h_) / float(fh);
-            const float x0 = float((int(extent.width) - hud_box_w_) / 2), y0 = float((fh - hud_box_h_) / 2);
+        const bool boxed = hud_redirect ? hud_boxed
+                                        : (hud_box_w_ && int(extent.height) == dsr::GetRuntime().config.render_height &&
+                                           int(extent.width) == dsr::GetRuntime().config.render_width && HudBoxed(p, vin));
+        if (boxed) {
+            const int fh = eh;
+            const float sx = float(hud_box_w_) / float(ew), sy = float(hud_box_h_) / float(fh);
+            const float x0 = float((ew - hud_box_w_) / 2), y0 = float((fh - hud_box_h_) / 2);
             d.dyn.vp.x = x0 + d.dyn.vp.x * sx;
             d.dyn.vp.width *= sx;
             d.dyn.vp.y = y0 + d.dyn.vp.y * sy;
@@ -4707,14 +6140,14 @@ private:
             VkRect2D& sc = d.dyn.sc;
             float l = x0, t = y0, r = x0 + float(hud_box_w_), b = y0 + float(hud_box_h_);
             if (st_.scissor_set && st_.scissor[2] > 0 && st_.scissor[3] > 0 &&
-                !(st_.scissor[0] <= 0 && st_.scissor[1] <= 0 && st_.scissor[2] >= int(extent.width) &&
-                  st_.scissor[3] >= int(extent.height))) {
+                !(st_.scissor[0] <= 0 && st_.scissor[1] <= 0 && st_.scissor[2] >= ew &&
+                  st_.scissor[3] >= eh)) {
                 const float kx = float(hud_box_w_) / 1280.0f, ky = float(hud_box_h_) / 720.0f;
                 l = std::max(l, x0 + float(st_.scissor[0]) * kx);
                 t = std::max(t, y0 + float(st_.scissor[1]) * ky);
                 // The game cuts its rectangles at the frame's edges (960 on a 4:3 frame, 540 high at a 0.75 render
                 // scale), which in layout units are not the layout's edges: one ending there runs to them.
-                const float right = st_.scissor[0] + st_.scissor[2] >= float(extent.width) - 0.5f
+                const float right = st_.scissor[0] + st_.scissor[2] >= float(ew) - 0.5f
                                         ? 1280.0f : st_.scissor[0] + st_.scissor[2];
                 const float bottom = st_.scissor[1] + st_.scissor[3] >= float(fh) - 0.5f
                                          ? 720.0f : st_.scissor[1] + st_.scissor[3];
@@ -4725,6 +6158,19 @@ private:
             sc.offset = {il, it};
             sc.extent = {uint32_t(std::max(0, ir - il)), uint32_t(std::max(0, ib - it))};
             hud_draws_boxed_++;
+        }
+        if (hud_redirect) {  // the game's frame -> the screen-sized image
+            const float kx = float(hud_w_) / float(ew), ky = float(hud_h_) / float(eh);
+            d.dyn.vp.x *= kx;
+            d.dyn.vp.width *= kx;
+            d.dyn.vp.y *= ky;
+            d.dyn.vp.height *= ky;
+            VkRect2D& sc2 = d.dyn.sc;
+            const int l = int(std::floor(float(sc2.offset.x) * kx)), t = int(std::floor(float(sc2.offset.y) * ky));
+            const int r = std::min(hud_w_, int(std::ceil(float(sc2.offset.x + int(sc2.extent.width)) * kx)));
+            const int b = std::min(hud_h_, int(std::ceil(float(sc2.offset.y + int(sc2.extent.height)) * ky)));
+            sc2.offset = {l, t};
+            sc2.extent = {uint32_t(std::max(0, r - l)), uint32_t(std::max(0, b - t))};
         }
         d.push[0] = st_.alpha_ref;
         d.indexed = use_indices;
@@ -4741,9 +6187,24 @@ private:
         for (const VkVertexInputBindingDescription& b : vin.bindings)
             instanced |= b.inputRate == VK_VERTEX_INPUT_RATE_INSTANCE;
         d.base_instance = instanced ? 0 : uint32_t(p.base_instance);
+        if (occ_query && !capture_active_ && recording_) {
+            Slot& osl = slots_[slot_];
+            if (osl.occ && osl.occ_used < kOccQueries) {
+                d.occ_pool = osl.occ;
+                d.occ_q = osl.occ_used++;
+                osl.occ_keys.push_back(occ_key);
+                osl.occ_area.push_back(depth ? uint32_t(std::min<uint64_t>(uint64_t(depth->width) * uint64_t(depth->height), 0xFFFFFFFFull)) : 0u);
+                occ_queried_++;
+            } else {
+                occ_reject_[10]++;
+            }
+        }
+        if (occ_query && d.occ_pool == VK_NULL_HANDLE) occ_state_[occ_key].veto = true;  // drawn without a query
         if (capture_active_ && query_pool_ && query_pass_.size() < kMaxQueries) {
             d.query = uint32_t(query_pass_.size());
             query_pass_.push_back(capture_pass_);
+            query_fs_.push_back(st_.program[1] ? st_.program[1]->hash : 0);
+            query_verts_.push_back(uint32_t(std::max(0, p.count)) * uint32_t(std::max(1, p.instances)));
         }
         if (capture_active_ && capture_draws_logged_ < 1500) {
             capture_draws_logged_++;
@@ -4852,6 +6313,17 @@ private:
                      (unsigned long long)(st_.program[0] ? st_.program[0]->hash : 0), colors.size(), st_.color.alpha_func,
                      st_.alpha_ref, st_.color.blend_enable, st_.channel.mask, st_.polygon.cull, st_.polygon.front_face,
                      int(st_.depth.depth_test), int(st_.depth.depth_write), int(st_.depth.stencil_test));
+            if (pass_draws_ <= 1) {  // the first draw names the pass's target (for the pass table)
+                char tt[96];
+                if (!colors.empty() && colors[0])
+                    snprintf(tt, sizeof(tt), "%dx%d f%d%s", colors[0]->width, colors[0]->height, colors[0]->nvn_format,
+                             colors.size() > 1 ? "+MRT" : "");
+                else if (depth)
+                    snprintf(tt, sizeof(tt), "depth %dx%d f%d", depth->width, depth->height, depth->nvn_format);
+                else
+                    snprintf(tt, sizeof(tt), "-");
+                pass_target_ = tt;
+            }
             pass_state_desc_ = d;
             pass_state_desc_ += " | targets:";
             for (size_t i = 0; i < colors.size(); i++) {
@@ -4922,9 +6394,18 @@ private:
         if (st_.program[1]) {
             pass_fs_hash_ = st_.program[1]->hash;
             pass_fs_addr_ = st_.program[1]->address;
+            if (capture_active_) {
+                if (pass_draws_ == 1) pass_fs_first_ = pass_fs_hash_;
+                bool seen = false;
+                for (uint32_t i = 0; i < pass_distinct_fs_ && i < 8; i++) seen |= pass_fs_seen_[i] == pass_fs_hash_;
+                if (!seen) {
+                    if (pass_distinct_fs_ < 8) pass_fs_seen_[pass_distinct_fs_] = pass_fs_hash_;
+                    pass_distinct_fs_++;
+                }
+            }
         }
         if (st_.program[0]) pass_vs_addr_ = st_.program[0]->address;
-        if (depth && st_.depth.depth_test && st_.depth.depth_write) depth_gen_++;
+        if (depth && st_.depth.depth_test && st_.depth.depth_write) depth->content_gen = ++depth_gen_;
         if (drawn_ == 1) LOGI(kTag, "first draw recorded");
     }
 
@@ -5092,7 +6573,13 @@ private:
             push_valid_ = true;
         }
         ApplyDynamicState(d.dyn);
-        if (d.query != UINT32_MAX) vkCmdBeginQuery(cb, query_pool_, d.query, 0);
+        // Precise: the number of pixels each draw shaded (not just whether any), for the capture's per-program table.
+        if (d.query != UINT32_MAX)
+            vkCmdBeginQuery(cb, query_pool_, d.query, features_.occlusionQueryPrecise ? VK_QUERY_CONTROL_PRECISE_BIT : 0);
+        if (d.occ_pool)
+            vkCmdBeginQuery(cb, d.occ_pool, d.occ_q,
+                            features_.occlusionQueryPrecise && dsr::GetRuntime().config.skip_hidden >= 3
+                                ? VK_QUERY_CONTROL_PRECISE_BIT : 0);
         if (d.indexed) {
             if (bound_ib_.first != d.index_buf || bound_ib_.second != d.index_off || bound_ib_type_ != d.index_type) {
                 vkCmdBindIndexBuffer(cb, d.index_buf, d.index_off, d.index_type);
@@ -5104,6 +6591,7 @@ private:
             vkCmdDraw(cb, d.count, d.instances, d.first_vertex, d.base_instance);
         }
         if (d.query != UINT32_MAX) vkCmdEndQuery(cb, query_pool_, d.query);
+        if (d.occ_pool) vkCmdEndQuery(cb, d.occ_pool, d.occ_q);
     }
 
     // Viewport, scissor, blend constants and stencil values of the draw (render thread).
@@ -5843,6 +7331,36 @@ private:
         auto now = std::chrono::steady_clock::now();
         if (now - last_report_ < std::chrono::seconds(10)) return;
         last_report_ = now;
+        if (dsr::GetRuntime().config.skip_hidden) {
+            LOGI(kTag, "skip_hidden: %llu draws left out and %llu drawn with a visibility query in the last 10 s, %zu draws tracked",
+                 (unsigned long long)occ_skipped_, (unsigned long long)occ_queried_, occ_state_.size());
+            LOGI(kTag, "skip_hidden: %llu draws judged; not judged because: shader depth test %llu, not indexed %llu, not triangles %llu, "
+                 "no depth target >= 256 wide %llu, no depth test %llu, stencil %llu, blending %llu, writes nothing %llu, no vertex program or "
+                 "buffer %llu, vertex constants unusable %llu; query not recorded %llu",
+                 (unsigned long long)occ_judged_, (unsigned long long)occ_reject_[0], (unsigned long long)occ_reject_[1],
+                 (unsigned long long)occ_reject_[2], (unsigned long long)occ_reject_[3], (unsigned long long)occ_reject_[4],
+                 (unsigned long long)occ_reject_[5], (unsigned long long)occ_reject_[6], (unsigned long long)occ_reject_[7],
+                 (unsigned long long)occ_reject_[8], (unsigned long long)occ_reject_[9], (unsigned long long)occ_reject_[10]);
+            if (dsr::GetRuntime().config.skip_hidden >= 3)
+                LOGI(kTag, "skip_hidden: %llu hidden draws came back into view, %llu kept in while their retest was pending, %llu kept in as large surfaces; view %s (still for %u frames)",
+                     (unsigned long long)occ_woke_, (unsigned long long)occ_kept_, (unsigned long long)occ_big_, occ_moving_ ? "moving" : "still", occ_still_);
+            if (dsr::GetRuntime().config.skip_hidden >= 3)
+                LOGI(kTag, "skip_hidden: %llu hidden draws retested early because a neighbour came back into view",
+                     (unsigned long long)occ_pulled_);
+            occ_skipped_ = occ_queried_ = occ_judged_ = occ_woke_ = occ_kept_ = occ_big_ = occ_pulled_ = 0;
+            for (uint64_t& r : occ_reject_) r = 0;
+        }
+        if (dsr::GetRuntime().config.skip_prepass) {
+            LOGI(kTag, "skip_prepass: %llu depth-only draws left out, %llu colour draws writing the depth, %llu colour draws without a twin (unchanged), %zu depth buffers tracked (last 10 s)",
+                 (unsigned long long)prepass_skipped_, (unsigned long long)prepass_converted_,
+                 (unsigned long long)prepass_unmatched_, prepass_.size());
+            prepass_skipped_ = prepass_converted_ = prepass_unmatched_ = 0;
+        }
+        if (post_depth_draws_) {
+            LOGI(kTag, "skip_post: %llu draws without colour (they write a depth that others sample) reached the draw, %llu of them left out by skip_hidden (last 10 s)",
+                 (unsigned long long)post_depth_draws_, (unsigned long long)post_depth_hidden_);
+            post_depth_draws_ = post_depth_hidden_ = 0;
+        }
         Drain();  // the recorder's counters below
         if (rec_started_) {
             LOGI(kTag, "recorder thread: busy %.0f ms in the last 10 s; render thread waited %.0f ms for it; %llu batches; "
@@ -5912,6 +7430,17 @@ private:
             LOGI(kTag, "render passes ended by (source line: count):%s", top.c_str());
             pass_breaks_.clear();
         }
+        {
+            std::vector<std::pair<uint64_t, int>> v;
+            for (auto& [line, n] : resumed_same_) v.push_back({n, line});
+            std::sort(v.rbegin(), v.rend());
+            std::string top;
+            for (size_t i = 0; i < v.size() && i < 8; i++)
+                top += " line " + std::to_string(v[i].second) + ": " + std::to_string(v[i].first) + ";";
+            LOGI(kTag, "passes restarted on the same targets they had just left (avoidable breaks, by ending line):%s",
+                 top.empty() ? " none" : top.c_str());
+            resumed_same_.clear();
+        }
         if (!sampled_breaks_.empty()) {
             std::vector<std::pair<uint64_t, std::string>> v;
             for (auto& [k, n] : sampled_breaks_) v.push_back({n, k});
@@ -5920,6 +7449,34 @@ private:
             for (size_t i = 0; i < v.size() && i < 8; i++) top += " [" + v[i].second + "]: " + std::to_string(v[i].first) + ";";
             LOGI(kTag, "textures that broke a render pass to become readable:%s", top.c_str());
             sampled_breaks_.clear();
+        }
+        if (!copy_counts_.empty()) {
+            std::vector<std::pair<uint64_t, std::string>> v;
+            for (auto& [k, n] : copy_counts_) v.push_back({n, k});
+            std::sort(v.rbegin(), v.rend());
+            std::string top;
+            for (size_t i = 0; i < v.size() && i < 6; i++) top += " [" + v[i].second + "]: " + std::to_string(v[i].first) + ";";
+            LOGI(kTag, "image copies that ended the render pass (last 10 s):%s", top.c_str());
+            copy_counts_.clear();
+        }
+        if (!post_census_.empty()) {
+            // Draws on small targets by fragment program: ones near the number of lists (frames) in this window are
+            // post-processing passes that run every frame; put their hash in settings skip_fs to leave them out.
+            std::vector<std::pair<uint64_t, std::pair<uint64_t, uint64_t>>> v;
+            for (auto& [k, n] : post_census_) v.push_back({n, k});
+            std::sort(v.rbegin(), v.rend());
+            std::string top;
+            char buf[96];
+            for (size_t i = 0; i < v.size() && i < 14; i++) {
+                snprintf(buf, sizeof(buf), " %016llx %ux%u x%llu;", (unsigned long long)v[i].second.first,
+                         unsigned(v[i].second.second >> 16), unsigned(v[i].second.second & 0xFFFF),
+                         (unsigned long long)v[i].first);
+                top += buf;
+            }
+            LOGI(kTag, "post census (fragment program, target, draws; %llu lists):%s",
+                 (unsigned long long)(list_counter_ - stat_lists_), top.c_str());
+            post_census_.clear();
+            census_max_area_ = 0;
         }
         LOGI(kTag, "last 10 s: %.0f ms executing lists (%.0f ms of it waiting for the GPU), %.1f MB streamed, %llu cached uploads",
              exec_ms_, wait_ms_, upload_bytes_ / 1048576.0, (unsigned long long)upload_hits_);
@@ -5951,6 +7508,11 @@ private:
              "in the shader",
              (unsigned long long)clears_deferred_, (unsigned long long)clears_in_pass_, (unsigned long long)clears_flushed_,
              (unsigned long long)pass_barriers_, (unsigned long long)lrz_touches_, (unsigned long long)shader_depth_draws_);
+        if (clears_dropped_) {
+            LOGI(kTag, "clears: %llu pending clears replaced by a newer one before use (not performed)",
+                 (unsigned long long)clears_dropped_);
+            clears_dropped_ = 0;
+        }
         clears_deferred_ = clears_in_pass_ = clears_flushed_ = pass_barriers_ = lrz_touches_ = shader_depth_draws_ = 0;
         if (rt_writebacks_ || reports_done_) {
             LOGI(kTag, "small render targets written back to game memory: %llu; reports written: %llu",
@@ -5964,6 +7526,11 @@ private:
                  "after %llu of them", (unsigned long long)list_b2b_copies_, (unsigned long long)list_updates_,
                  (unsigned long long)geo_rechecks_);
             list_b2b_copies_ = list_updates_ = geo_rechecks_ = 0;
+        }
+        if (zero_standins_) {
+            LOGI(kTag, "skip_fs: %llu reads of skipped-pass targets served by a black stand-in (no pass break)",
+                 (unsigned long long)zero_standins_);
+            zero_standins_ = 0;
         }
         if (padded_fetches_ || view_standins_) {
             LOGI(kTag, "draws reading vertex data past their bound buffer: %llu; with a stand-in for a "
@@ -6208,6 +7775,12 @@ private:
     }
     bool recording_ = false, rendering_ = false;
     std::vector<uint64_t> rendering_key_;
+    // Diagnostics: the targets of the pass that ended last and the source line that ended it. A pass that starts
+    // again on exactly those targets paid a store and a reload of its whole tile memory for nothing (a break that a
+    // different order of the game's work could have spared); counted per ending line.
+    std::vector<uint64_t> last_end_key_;
+    int last_end_line_ = 0;
+    std::map<int, uint64_t> resumed_same_;
 
     VkBuffer stream_ = VK_NULL_HANDLE;
     VkDeviceMemory stream_memory_ = VK_NULL_HANDLE;
@@ -6300,8 +7873,790 @@ private:
         if (full) hud_full_screen_++;
         return !full;
     }
+    // ---- hud_full_res ------------------------------------------------------------------------------------------
+    // Size of the screen-sized HUD image for a game frame (0 = the feature is off, or the screen is not much bigger
+    // than the frame): the frame's aspect ratio fitted into the window.
+    void HudUpdateSize(const Image& f) {
+        int w = 0, h = 0;
+        const dsr::RuntimeConfig& cfg = dsr::GetRuntime().config;
+        if (cfg.hud_full_res && win_w_ > 0 && win_h_ > 0 && f.width > 0 && f.height > 0) {
+            double k = std::min(double(win_w_) / f.width, double(win_h_) / f.height);
+            // hud_max_height: the picture (and the HUD on it) is at most this many lines tall; the system compositor
+            // enlarges it to the screen. Fewer pixels for FSR, the HUD and the final pass on a weak GPU (Mali).
+            if (cfg.hud_max_height >= 360 && f.height * k > cfg.hud_max_height)
+                k = std::max(1.0, double(cfg.hud_max_height) / f.height);
+            // FXAA (settings fxaa) runs in the HUD path, so it is also used when the screen is barely bigger than the
+            // frame (a 720p phone at the game's own size); without it only from 1.2x on.
+            if (k >= (cfg.fxaa > 0 ? 1.0 : 1.2)) {
+                w = int(std::lround(f.width * k));
+                h = int(std::lround(f.height * k));
+            }
+        }
+        hud_w_ = w;
+        hud_h_ = h;
+        hud_src_w_ = w ? f.width : 0;
+        hud_src_h_ = w ? f.height : 0;
+    }
+    // Whether a draw renders only to one target of the game's frame size (no depth, a plain view): the draws
+    // hud_full_res can redirect.
+    bool HudTarget(const std::vector<Image*>& colors, const Image* depth) const {
+        const Image* f = colors[0];
+        if (depth || !f || f->width != hud_src_w_ || f->height != hud_src_h_ || f->levels != 1 || f->layers != 1)
+            return false;
+        if (st_.rts.empty() || st_.rts[0].view_format || st_.rts[0].layer || st_.rts[0].level) return false;
+        for (size_t i = 1; i < colors.size(); i++)
+            if (colors[i]) return false;
+        return true;
+    }
+    // 0 = not a blended 2D HUD / menu draw; 1 = one that stays in the 16:9 box (hud_box); 2 = a blending full-screen
+    // one (fades, dimming behind menus). Same tests as HudBoxed.
+    int HudClass(const DrawParams& p, const VertexInput& vin) {
+        float sx, sy;
+        if (!Projection2D(&sx, &sy) || std::fabs(sx - 2.0f / 1280.0f) > 1e-6f || std::fabs(sy + 2.0f / 720.0f) > 1e-6f)
+            return 0;
+        if (!(st_.color.blend_enable & 1)) return 0;
+        float x0, x1, y0, y1;
+        if (!DrawBounds(p, vin, &x0, &x1, &y0, &y1)) return 1;
+        return (x0 <= 2.0f && x1 >= 1278.0f && y0 <= 2.0f && y1 >= 718.0f) ? 2 : 1;
+    }
+    // A screen-sized image like the game frame `f` in `slot`, made (again) when its size or format changed.
+    bool HudEnsureImage(Image& slot, const Image& f) {
+        if (slot.image && slot.width == hud_w_ && slot.height == hud_h_ && slot.vk_format == f.vk_format) return true;
+        if (slot.image) DestroyImage(slot);  // retired: destroyed once the GPU is done with it
+        Image h;
+        h.vk_format = f.vk_format;
+        h.nvn_format = f.nvn_format;
+        h.target = f.target;
+        h.type = VK_IMAGE_TYPE_2D;
+        h.width = hud_w_;
+        h.height = hud_h_;
+        h.aspect = f.aspect;
+        h.features = f.features;
+        if (!(h.features & VK_FORMAT_FEATURE_BLIT_DST_BIT) || !(h.features & VK_FORMAT_FEATURE_BLIT_SRC_BIT)) return false;
+        if (!AllocImage(h, false, false, &h.image, &h.memory)) return false;
+        slot = std::move(h);
+        LOGI(kTag, "hud_full_res: %s image %dx%d (the game's frame is %dx%d)",
+             &slot == &hud_img_ ? "HUD" : (&slot == &hud2_img_ ? "final pass" : "FSR 1 intermediate"),
+             hud_w_, hud_h_, f.width, f.height);
+        return true;
+    }
+    // Enlarges the 3D picture drawn so far on `f` into the HUD image; the frame's HUD draws then go there.
+    bool HudStart(Image& f) {
+        if (!HudEnsureImage(hud_img_, f)) return false;
+        EndRendering();
+        // settings fxaa: FXAA 3.11 over the picture at the game's render size first (cheaper than at the screen's
+        // size); FSR 1 or the blit below then enlarge its result. Nothing to enlarge: it draws into the HUD image.
+        Image* src = &f;
+        bool done = false;
+        if (dsr::GetRuntime().config.fxaa > 0 && PostFxUsable(f)) {
+            const bool same_size = hud_w_ == f.width && hud_h_ == f.height;
+            Image* dst = same_size ? &hud_img_ : nullptr;
+            if (!dst && PostEnsureImage(post_fxaa_img_, f, f.width, f.height)) dst = &post_fxaa_img_;
+            if (dst && PostFxaa(f, *dst, dsr::GetRuntime().config.fxaa >= 2)) {
+                if (dst == &hud_img_) done = true;
+                else src = dst;
+            }
+        }
+        if (done) {
+            hud_img_.written = true;
+            hud_t_addr_ = f.addr;
+            return true;
+        }
+#ifdef DSR_HAVE_FSR1
+        if (Fsr1Upscale(*src)) {
+            hud_img_.written = true;
+            hud_t_addr_ = f.addr;
+            return true;
+        }
+#endif
+        Transition(*src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        Transition(hud_img_, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        VkImageBlit b{};
+        b.srcSubresource = {src->aspect, 0, 0, 1};
+        b.srcOffsets[1] = {src->width, src->height, 1};
+        b.dstSubresource = {hud_img_.aspect, 0, 0, 1};
+        b.dstOffsets[1] = {hud_w_, hud_h_, 1};
+        const VkFilter filter = (dsr::GetRuntime().config.scale_filter == 0 ||
+                                 !(f.features & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT))
+                                    ? VK_FILTER_NEAREST
+                                    : VK_FILTER_LINEAR;
+        Rec([b, filter, si = src->image, di = hud_img_.image](VkCommandBuffer cb) {
+            vkCmdBlitImage(cb, si, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, di, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b,
+                           filter);
+        });
+        hud_img_.written = true;
+        hud_t_addr_ = f.addr;
+        return true;
+    }
+    // ---- post-processing passes: FXAA 3.11 (from gu-native) (FSR 1 stays in Fsr1*) -------------
+    // All are fragment passes over a full-screen triangle (render pass objects, which every driver has), so no storage
+    // images, no compute and no capability beyond Shader / ImageQuery are needed: they run on a Mali-G57 as anywhere.
+    // The SPIR-V is compiled from shaders/*.{vert,frag} by tools/gen_postfx_shaders.py (postfx_spv.h).
+    enum PostKind { kPostFxaaFast, kPostFxaaQuality, kPostKinds };
+    struct PostPipe {
+        VkPipeline pipe = VK_NULL_HANDLE;
+        VkRenderPass rp = VK_NULL_HANDLE;
+        VkFormat fmt = VK_FORMAT_UNDEFINED;
+        int kind = 0;
+    };
+    struct PostJob {  // one pass, as queued for the recorder
+        VkPipeline pipe;
+        VkRenderPass rp;
+        VkFramebuffer fb;
+        VkImageView src_view;
+        uint32_t w, h, push_size;
+        uint32_t push[20];
+    };
+    VkShaderModule post_vs_ = VK_NULL_HANDLE, post_fs_[kPostKinds] = {};
+    VkDescriptorSetLayout post_set_layout_ = VK_NULL_HANDLE;
+    VkPipelineLayout post_layout_ = VK_NULL_HANDLE;
+    VkSampler post_sampler_ = VK_NULL_HANDLE;
+    std::vector<PostPipe> post_pipes_;
+    bool post_ready_ = false, post_failed_ = false;
+    Image post_fxaa_img_;  // FXAA's output at the game's render size
+
+    static uint32_t FloatBits(float v) {
+        uint32_t u;
+        memcpy(&u, &v, sizeof(u));
+        return u;
+    }
+    // Linear-light formats (sRGB views and float formats sample as linear values): the passes work in gamma 2.0 space.
+    static bool PostPerceptual(VkFormat f) {
+        switch (f) {
+            case VK_FORMAT_R8G8B8A8_SRGB: case VK_FORMAT_B8G8R8A8_SRGB: case VK_FORMAT_A8B8G8R8_SRGB_PACK32:
+            case VK_FORMAT_R16G16B16A16_SFLOAT: case VK_FORMAT_B10G11R11_UFLOAT_PACK32:
+            case VK_FORMAT_R32G32B32A32_SFLOAT:
+                return true;
+            default:
+                return false;
+        }
+    }
+    bool PostInit() {
+        if (post_ready_) return true;
+        if (post_failed_) return false;
+        post_failed_ = true;  // until everything below is made
+        if (props_.limits.maxPushConstantsSize < 80) {
+            LOGW(kTag, "post-processing off: push constants of %u bytes only", props_.limits.maxPushConstantsSize);
+            return false;
+        }
+        auto module = [&](const uint32_t* code, size_t bytes, VkShaderModule* out) {
+            VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+            ci.codeSize = bytes;
+            ci.pCode = code;
+            return vkCreateShaderModule(device_, &ci, nullptr, out) == VK_SUCCESS;
+        };
+        namespace sp = postfx_spv;
+        if (!module(sp::kFullscreenVert, sp::kFullscreenVertSize, &post_vs_) ||
+            !module(sp::kFxaaFastFrag, sp::kFxaaFastFragSize, &post_fs_[kPostFxaaFast]) ||
+            !module(sp::kFxaaQualityFrag, sp::kFxaaQualityFragSize, &post_fs_[kPostFxaaQuality])) {
+            LOGW(kTag, "post-processing off: a shader module could not be made");
+            return false;
+        }
+        VkDescriptorSetLayoutBinding bind{0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT,
+                                          nullptr};
+        VkDescriptorSetLayoutCreateInfo li{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        li.bindingCount = 1;
+        li.pBindings = &bind;
+        if (vkCreateDescriptorSetLayout(device_, &li, nullptr, &post_set_layout_) != VK_SUCCESS) return false;
+        VkPushConstantRange pr{VK_SHADER_STAGE_FRAGMENT_BIT, 0, 80};
+        VkPipelineLayoutCreateInfo pl{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        pl.setLayoutCount = 1;
+        pl.pSetLayouts = &post_set_layout_;
+        pl.pushConstantRangeCount = 1;
+        pl.pPushConstantRanges = &pr;
+        if (vkCreatePipelineLayout(device_, &pl, nullptr, &post_layout_) != VK_SUCCESS) return false;
+        VkSamplerCreateInfo sci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+        sci.magFilter = sci.minFilter = VK_FILTER_LINEAR;
+        sci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+        sci.addressModeU = sci.addressModeV = sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        sci.maxLod = 0.0f;
+        sci.borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
+        if (vkCreateSampler(device_, &sci, nullptr, &post_sampler_) != VK_SUCCESS) return false;
+        post_failed_ = false;
+        post_ready_ = true;
+        LOGI(kTag, "post-processing ready (FXAA fast / quality) on %s%s", props_.deviceName,
+             gpu_mali_ ? " (Mali)" : "");
+        return true;
+    }
+    // Whether the passes can run with `f` as the picture: the format must be filterable and drawable.
+    bool PostFxUsable(const Image& f) {
+        if (!PostInit()) return false;
+        constexpr VkFormatFeatureFlags kNeed =
+            VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT |
+            VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT;
+        return f.type == VK_IMAGE_TYPE_2D && f.levels == 1 && f.layers == 1 && f.aspect == VK_IMAGE_ASPECT_COLOR_BIT &&
+               (f.features & kNeed) == kNeed;
+    }
+    // An image like `f` at w x h in `slot`, made (again) when its size or format changed; retired like any image.
+    bool PostEnsureImage(Image& slot, const Image& f, int w, int h) {
+        if (slot.image && slot.width == w && slot.height == h && slot.vk_format == f.vk_format) return true;
+        if (slot.image) DestroyImage(slot);
+        Image n;
+        n.vk_format = f.vk_format;
+        n.nvn_format = f.nvn_format;
+        n.target = f.target;
+        n.type = VK_IMAGE_TYPE_2D;
+        n.width = w;
+        n.height = h;
+        n.aspect = f.aspect;
+        n.features = f.features;
+        if (!AllocImage(n, false, false, &n.image, &n.memory)) return false;
+        slot = std::move(n);
+        LOGI(kTag, "post-processing image %dx%d (format %d)", w, h, int(slot.vk_format));
+        return true;
+    }
+    VkPipeline PostPipeline(int kind, VkFormat fmt, VkRenderPass* rp_out) {
+        for (const PostPipe& pp : post_pipes_)
+            if (pp.kind == kind && pp.fmt == fmt) {
+                *rp_out = pp.rp;
+                return pp.pipe;
+            }
+        const VkAttachmentLoadOp dont_care = VK_ATTACHMENT_LOAD_OP_DONT_CARE;  // every pass covers its whole target
+        VkRenderPass rp = MakeRenderPass(&fmt, 1, VK_FORMAT_UNDEFINED, VK_FORMAT_UNDEFINED, &dont_care,
+                                         VK_ATTACHMENT_LOAD_OP_LOAD);
+        if (!rp) return VK_NULL_HANDLE;
+        VkPipelineShaderStageCreateInfo stages[2]{};
+        stages[0].sType = stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+        stages[0].module = post_vs_;
+        stages[0].pName = "main";
+        stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+        stages[1].module = post_fs_[kind];
+        stages[1].pName = "main";
+        VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+        VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+        ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+        VkPipelineViewportStateCreateInfo vp{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+        vp.viewportCount = vp.scissorCount = 1;
+        VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+        rs.polygonMode = VK_POLYGON_MODE_FILL;
+        rs.cullMode = VK_CULL_MODE_NONE;
+        rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+        rs.lineWidth = 1.0f;
+        VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+        ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+        VkPipelineColorBlendAttachmentState att{};
+        att.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT |
+                             VK_COLOR_COMPONENT_A_BIT;
+        VkPipelineColorBlendStateCreateInfo cb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+        cb.attachmentCount = 1;
+        cb.pAttachments = &att;
+        const VkDynamicState dyn[2] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+        VkPipelineDynamicStateCreateInfo dy{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+        dy.dynamicStateCount = 2;
+        dy.pDynamicStates = dyn;
+        VkGraphicsPipelineCreateInfo ci{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+        ci.stageCount = 2;
+        ci.pStages = stages;
+        ci.pVertexInputState = &vi;
+        ci.pInputAssemblyState = &ia;
+        ci.pViewportState = &vp;
+        ci.pRasterizationState = &rs;
+        ci.pMultisampleState = &ms;
+        ci.pColorBlendState = &cb;
+        ci.pDynamicState = &dy;
+        ci.layout = post_layout_;
+        ci.renderPass = rp;
+        VkPipeline pipe = VK_NULL_HANDLE;
+        if (vkCreateGraphicsPipelines(device_, pipeline_cache_, 1, &ci, nullptr, &pipe) != VK_SUCCESS) {
+            LOGW(kTag, "post-processing pipeline %d (format %d) failed", kind, int(fmt));
+            return VK_NULL_HANDLE;
+        }
+        post_pipes_.push_back({pipe, rp, fmt, kind});
+        *rp_out = rp;
+        return pipe;
+    }
+    VkFramebuffer PostFramebuffer(VkRenderPass rp, VkImageView view, uint32_t w, uint32_t h) {
+        // Cached like the draws' framebuffers (same key layout: they go when the view is destroyed with its image).
+        std::vector<uint64_t> key{reinterpret_cast<uint64_t>(rp), uint64_t(w) << 32 | h, reinterpret_cast<uint64_t>(view)};
+        {
+            std::lock_guard<std::mutex> lk(fb_mutex_);
+            auto it = fb_cache_.find(key);
+            if (it != fb_cache_.end()) return it->second;
+        }
+        VkFramebufferCreateInfo fi{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+        fi.renderPass = rp;
+        fi.attachmentCount = 1;
+        fi.pAttachments = &view;
+        fi.width = w;
+        fi.height = h;
+        fi.layers = 1;
+        VkFramebuffer fb = VK_NULL_HANDLE;
+        if (vkCreateFramebuffer(device_, &fi, nullptr, &fb) != VK_SUCCESS) return VK_NULL_HANDLE;
+        std::lock_guard<std::mutex> lk(fb_mutex_);
+        fb_cache_.emplace(std::move(key), fb);
+        return fb;
+    }
+    // Recorder thread: a descriptor set of post_set_layout_ from the slot's pool (a full pool continues in another).
+    bool AllocPostSet(VkDescriptorSet* set) {
+        VkDescriptorSetAllocateInfo dai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        dai.descriptorSetCount = 1;
+        dai.pSetLayouts = &post_set_layout_;
+        for (int tries = 0; tries < 3; tries++) {
+            dai.descriptorPool = desc_pool_;
+            if (vkAllocateDescriptorSets(device_, &dai, set) == VK_SUCCESS) return true;
+            Slot& sl = slots_[rec_slot_];
+            if (sl.extra_used >= sl.extra_pools.size()) {
+                const VkDescriptorPool np = MakeDescriptorPool();
+                if (!np) return false;
+                sl.extra_pools.push_back(np);
+                desc_pools_added_++;
+            }
+            desc_pool_ = sl.extra_pools[sl.extra_used++];
+        }
+        return false;
+    }
+    // Recorder thread: one full-target pass sampling job.src_view.
+    void RecordPostPass(VkCommandBuffer cb, const PostJob& j) {
+        VkDescriptorSet set = VK_NULL_HANDLE;
+        if (!AllocPostSet(&set)) {
+            LogOnce("postfx_set", "post-processing: no descriptor set");
+            return;
+        }
+        VkDescriptorImageInfo ii{post_sampler_, j.src_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+        VkWriteDescriptorSet wr{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        wr.dstSet = set;
+        wr.descriptorCount = 1;
+        wr.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        wr.pImageInfo = &ii;
+        vkUpdateDescriptorSets(device_, 1, &wr, 0, nullptr);
+        const VkRect2D area{{0, 0}, {j.w, j.h}};
+        VkRenderPassBeginInfo bi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+        bi.renderPass = j.rp;
+        bi.framebuffer = j.fb;
+        bi.renderArea = area;
+        vkCmdBeginRenderPass(cb, &bi, VK_SUBPASS_CONTENTS_INLINE);
+        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, j.pipe);
+        vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, post_layout_, 0, 1, &set, 0, nullptr);
+        vkCmdPushConstants(cb, post_layout_, VK_SHADER_STAGE_FRAGMENT_BIT, 0, j.push_size, j.push);
+        const VkViewport vp{0.0f, 0.0f, float(j.w), float(j.h), 0.0f, 1.0f};
+        vkCmdSetViewport(cb, 0, 1, &vp);
+        vkCmdSetScissor(cb, 0, 1, &area);
+        vkCmdDraw(cb, 3, 1, 0, 0);
+        vkCmdEndRenderPass(cb);
+        // The pass bound its own pipeline, sets, dynamic state and push constants: the draws' cached state is stale.
+        InvalidateBoundState();
+    }
+    // One pass: `src` (sampled) into `dst` (rendered), both whole. False (nothing recorded) when it cannot be done.
+    bool PostPass(int kind, Image& src, Image& dst, const uint32_t* push, uint32_t push_words) {
+        VkRenderPass rp = VK_NULL_HANDLE;
+        const VkPipeline pipe = PostPipeline(kind, dst.vk_format, &rp);
+        if (!pipe) return false;
+        static const uint8_t kIdentity[4] = {2, 3, 4, 5};
+        Transition(src, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        Transition(dst, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+        const VkImageView sv = View(src, VK_IMAGE_VIEW_TYPE_2D, 0, 1, 1, src.aspect, kIdentity);
+        const VkImageView dv = AttachmentView(dst);
+        const VkFramebuffer fb = dv ? PostFramebuffer(rp, dv, uint32_t(dst.width), uint32_t(dst.height)) : VK_NULL_HANDLE;
+        if (!sv || !fb) return false;
+        PostJob j{};
+        j.pipe = pipe;
+        j.rp = rp;
+        j.fb = fb;
+        j.src_view = sv;
+        j.w = uint32_t(dst.width);
+        j.h = uint32_t(dst.height);
+        j.push_size = push_words * 4;
+        memcpy(j.push, push, push_words * 4);
+        Rec([this, j](VkCommandBuffer cb) { RecordPostPass(cb, j); });
+        dst.written = true;
+        // The next user of `dst` is either a sampling pass (readable by fragment shaders as soon as this pass ends) or,
+        // for the HUD image, the HUD's own render passes, which need a barrier after this one (BeginRendering).
+        if (&dst == &post_fxaa_img_) PassEndBarrier(dst);
+        else dst.attach_unsynced = true;
+        return true;
+    }
+    bool PostFxaa(Image& src, Image& dst, bool quality) {
+        const uint32_t push[1] = {PostPerceptual(src.vk_format) ? 1u : 0u};
+        return PostPass(quality ? kPostFxaaQuality : kPostFxaaFast, src, dst, push, 1);
+    }
+    bool gpu_mali_ = false;  // an Arm Mali (the device's name)
+#ifdef DSR_HAVE_FSR1
+    // ---- FSR 1 (settings upscaler = 1: EASU, 2: EASU + RCAS) ---------------------------------------------------
+    // Replaces the bilinear blit that enlarges the 3D picture into the screen-sized HUD image (HudStart): EASU
+    // (edge-adaptive upscaling) draws the picture at the screen's size, and RCAS (sharpening) draws it again into the
+    // HUD image. Two full-screen passes at the screen's size: it costs GPU time, so it is for looking better at a low
+    // 3D resolution, not for speed. Needs dynamic rendering; anything missing leaves the plain blit (logged once).
+    struct Fsr1 {
+        bool tried = false, ok = false;
+        VkDescriptorSetLayout dsl = VK_NULL_HANDLE;
+        VkPipelineLayout lay_easu = VK_NULL_HANDLE, lay_rcas = VK_NULL_HANDLE;
+        VkShaderModule vs = VK_NULL_HANDLE, easu = VK_NULL_HANDLE, rcas = VK_NULL_HANDLE;
+        VkSampler samp = VK_NULL_HANDLE;
+        VkDescriptorPool pool = VK_NULL_HANDLE;
+        static constexpr int kSets = 16;  // a ring: a set is written again only kSets / 2 frames later
+        VkDescriptorSet sets[kSets] = {};
+        int next = 0;
+        std::map<std::pair<int, VkFormat>, VkPipeline> pipes;
+        uint64_t frames = 0;
+    } fsr1_;
+    Image fsr1_tmp_;  // EASU's output when RCAS follows
+
+    bool Fsr1Init() {
+        if (fsr1_.tried) return fsr1_.ok;
+        fsr1_.tried = true;
+        if (!begin_rendering_ || !end_rendering_ || rp_fallback_) {
+            LOGW(kTag, "upscaler: FSR 1 needs dynamic rendering; the plain blit stays");
+            return false;
+        }
+        auto module = [&](const unsigned char* code, size_t size, VkShaderModule* out) {
+            VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+            ci.codeSize = size;
+            ci.pCode = reinterpret_cast<const uint32_t*>(code);
+            return vkCreateShaderModule(device_, &ci, nullptr, out) == VK_SUCCESS;
+        };
+        VkDescriptorSetLayoutBinding bind{};
+        bind.binding = 0;
+        bind.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        bind.descriptorCount = 1;
+        bind.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        VkDescriptorSetLayoutCreateInfo dl{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        dl.bindingCount = 1;
+        dl.pBindings = &bind;
+        VkSamplerCreateInfo sc{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+        sc.magFilter = sc.minFilter = VK_FILTER_LINEAR;
+        sc.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+        sc.addressModeU = sc.addressModeV = sc.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        sc.maxLod = 0.25f;
+        bool ok = module(kFsr1VertSpv, sizeof kFsr1VertSpv, &fsr1_.vs) &&
+                  module(kFsr1EasuSpv, sizeof kFsr1EasuSpv, &fsr1_.easu) &&
+                  module(kFsr1RcasSpv, sizeof kFsr1RcasSpv, &fsr1_.rcas) &&
+                  vkCreateDescriptorSetLayout(device_, &dl, nullptr, &fsr1_.dsl) == VK_SUCCESS &&
+                  vkCreateSampler(device_, &sc, nullptr, &fsr1_.samp) == VK_SUCCESS;
+        if (ok) {
+            VkPushConstantRange pr{VK_SHADER_STAGE_FRAGMENT_BIT, 0, 64};
+            VkPipelineLayoutCreateInfo pl{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+            pl.setLayoutCount = 1;
+            pl.pSetLayouts = &fsr1_.dsl;
+            pl.pushConstantRangeCount = 1;
+            pl.pPushConstantRanges = &pr;
+            ok = vkCreatePipelineLayout(device_, &pl, nullptr, &fsr1_.lay_easu) == VK_SUCCESS;
+            pr.size = 16;
+            ok = ok && vkCreatePipelineLayout(device_, &pl, nullptr, &fsr1_.lay_rcas) == VK_SUCCESS;
+        }
+        if (ok) {
+            VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, uint32_t(Fsr1::kSets)};
+            VkDescriptorPoolCreateInfo dp{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+            dp.maxSets = uint32_t(Fsr1::kSets);
+            dp.poolSizeCount = 1;
+            dp.pPoolSizes = &ps;
+            VkDescriptorSetLayout layouts[Fsr1::kSets];
+            for (auto& l : layouts) l = fsr1_.dsl;
+            VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+            ok = vkCreateDescriptorPool(device_, &dp, nullptr, &fsr1_.pool) == VK_SUCCESS;
+            ai.descriptorPool = fsr1_.pool;
+            ai.descriptorSetCount = uint32_t(Fsr1::kSets);
+            ai.pSetLayouts = layouts;
+            ok = ok && vkAllocateDescriptorSets(device_, &ai, fsr1_.sets) == VK_SUCCESS;
+        }
+        fsr1_.ok = ok;
+        LOGI(kTag, "upscaler: FSR 1 %s", ok ? "ready" : "could not be set up; the plain blit stays");
+        return ok;
+    }
+    VkPipeline Fsr1Pipeline(bool rcas, VkFormat format) {
+        const auto key = std::make_pair(rcas ? 1 : 0, format);
+        auto it = fsr1_.pipes.find(key);
+        if (it != fsr1_.pipes.end()) return it->second;
+        VkPipelineShaderStageCreateInfo stages[2] = {{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO},
+                                                     {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}};
+        stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+        stages[0].module = fsr1_.vs;
+        stages[0].pName = "main";
+        stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+        stages[1].module = rcas ? fsr1_.rcas : fsr1_.easu;
+        stages[1].pName = "main";
+        VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+        VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+        ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+        VkPipelineViewportStateCreateInfo vp{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+        vp.viewportCount = 1;
+        vp.scissorCount = 1;
+        VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+        rs.polygonMode = VK_POLYGON_MODE_FILL;
+        rs.cullMode = VK_CULL_MODE_NONE;
+        rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+        rs.lineWidth = 1.0f;
+        VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+        ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+        VkPipelineColorBlendAttachmentState ba{};
+        ba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT |
+                            VK_COLOR_COMPONENT_A_BIT;
+        VkPipelineColorBlendStateCreateInfo cb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+        cb.attachmentCount = 1;
+        cb.pAttachments = &ba;
+        const VkDynamicState dyn[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+        VkPipelineDynamicStateCreateInfo dy{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+        dy.dynamicStateCount = 2;
+        dy.pDynamicStates = dyn;
+        VkPipelineRenderingCreateInfo ri{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+        ri.colorAttachmentCount = 1;
+        ri.pColorAttachmentFormats = &format;
+        VkGraphicsPipelineCreateInfo ci{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+        ci.pNext = &ri;
+        ci.stageCount = 2;
+        ci.pStages = stages;
+        ci.pVertexInputState = &vi;
+        ci.pInputAssemblyState = &ia;
+        ci.pViewportState = &vp;
+        ci.pRasterizationState = &rs;
+        ci.pMultisampleState = &ms;
+        ci.pColorBlendState = &cb;
+        ci.pDynamicState = &dy;
+        ci.layout = rcas ? fsr1_.lay_rcas : fsr1_.lay_easu;
+        VkPipeline p = VK_NULL_HANDLE;
+        if (vkCreateGraphicsPipelines(device_, pipeline_cache_, 1, &ci, nullptr, &p) != VK_SUCCESS) p = VK_NULL_HANDLE;
+        fsr1_.pipes[key] = p;
+        if (!p) LOGW(kTag, "upscaler: FSR 1 %s pipeline for format %d failed; the plain blit stays", rcas ? "RCAS" : "EASU",
+                     int(format));
+        return p;
+    }
+    // One full-screen pass: `src` sampled, `dst` drawn at w x h. Runs on the recorder.
+    void Fsr1Pass(bool rcas, Image& src, Image& dst, const uint32_t* pc, uint32_t pc_size) {
+        VkPipeline pipe = Fsr1Pipeline(rcas, dst.vk_format);
+        static const uint8_t kIdentity[4] = {2, 3, 4, 5};
+        VkImageView sv = View(src, VK_IMAGE_VIEW_TYPE_2D, 0, 1, 1, VK_IMAGE_ASPECT_COLOR_BIT, kIdentity);
+        VkImageView dv = AttachmentView(dst);
+        Transition(src, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        Transition(dst, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+        const VkPipelineLayout lay = rcas ? fsr1_.lay_rcas : fsr1_.lay_easu;
+        const VkDescriptorSet set = fsr1_.sets[fsr1_.next];
+        fsr1_.next = (fsr1_.next + 1) % Fsr1::kSets;
+        const VkSampler samp = fsr1_.samp;
+        const uint32_t w = uint32_t(dst.width), h = uint32_t(dst.height);
+        uint32_t consts[16] = {};
+        std::memcpy(consts, pc, pc_size);
+        Rec([this, pipe, lay, set, samp, sv, dv, w, h, consts, pc_size](VkCommandBuffer cb) {
+            VkDescriptorImageInfo ii{samp, sv, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+            VkWriteDescriptorSet wr{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+            wr.dstSet = set;
+            wr.dstBinding = 0;
+            wr.descriptorCount = 1;
+            wr.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            wr.pImageInfo = &ii;
+            vkUpdateDescriptorSets(device_, 1, &wr, 0, nullptr);
+            VkRenderingAttachmentInfo ca{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+            ca.imageView = dv;
+            ca.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+            ca.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;  // every pixel is written
+            ca.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+            VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
+            ri.renderArea = {{0, 0}, {w, h}};
+            ri.layerCount = 1;
+            ri.colorAttachmentCount = 1;
+            ri.pColorAttachments = &ca;
+            begin_rendering_(cb, &ri);
+            vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+            vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, lay, 0, 1, &set, 0, nullptr);
+            vkCmdPushConstants(cb, lay, VK_SHADER_STAGE_FRAGMENT_BIT, 0, pc_size, consts);
+            const VkViewport vp{0, 0, float(w), float(h), 0.0f, 1.0f};
+            const VkRect2D rect{{0, 0}, {w, h}};
+            vkCmdSetViewport(cb, 0, 1, &vp);
+            vkCmdSetScissor(cb, 0, 1, &rect);
+            vkCmdDraw(cb, 3, 1, 0, 0);
+            end_rendering_(cb);
+            VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+            mb.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+            mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
+                               VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT;
+            vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                                 VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+                                     VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                 0, 1, &mb, 0, nullptr, 0, nullptr);
+            InvalidateBoundState();  // (the recorder's pipeline, sets and dynamic state are not the ones bound now)
+        });
+        dst.attach_unsynced = false;
+        dst.frag_only_sync = false;
+        dst.written = true;
+    }
+    // Draws the game's 3D picture `f` into hud_img_ (already made at the screen's size) with FSR 1. False: not done
+    // (off, not available), the caller blits.
+    bool Fsr1Upscale(Image& f) {
+        const int mode = dsr::GetRuntime().config.upscaler;
+        if (mode <= 0 || !Fsr1Init()) return false;
+        if (f.type != VK_IMAGE_TYPE_2D || f.levels != 1 || f.layers != 1 || f.aspect != VK_IMAGE_ASPECT_COLOR_BIT ||
+            !(f.features & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) ||
+            !(hud_img_.features & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT))
+            return false;
+        const bool rcas = mode >= 2;
+        if (rcas && !HudEnsureImage(fsr1_tmp_, f)) return false;
+        if (!Fsr1Pipeline(false, hud_img_.vk_format) || (rcas && !Fsr1Pipeline(true, hud_img_.vk_format))) return false;
+        auto bits = [](float v) {
+            uint32_t u;
+            std::memcpy(&u, &v, 4);
+            return u;
+        };
+        const float iw = float(f.width), ih = float(f.height), ow = float(hud_w_), oh = float(hud_h_);
+        // (AMD's ffxFsrPopulateEasuConstants: the input is the whole image, no offset)
+        const uint32_t easu[16] = {bits(iw / ow), bits(ih / oh), bits(0.5f * iw / ow - 0.5f), bits(0.5f * ih / oh - 0.5f),
+                                   bits(1.0f / iw), bits(1.0f / ih), bits(1.0f / iw), bits(-1.0f / ih),
+                                   bits(-1.0f / iw), bits(2.0f / ih), bits(1.0f / iw), bits(2.0f / ih),
+                                   bits(0.0f), bits(4.0f / ih), 0, 0};
+        Fsr1Pass(false, f, rcas ? fsr1_tmp_ : hud_img_, easu, 64);
+        if (rcas) {
+            const float pct = float(std::clamp(dsr::GetRuntime().config.fsr_sharpness, 0, 100));
+            const float stops = 2.0f * (1.0f - pct / 100.0f);  // RCAS: 0 stops = the sharpest, 2 = a quarter of it
+            const uint32_t con[4] = {bits(std::exp2(-stops)), 0, 0, 0};
+            Fsr1Pass(true, fsr1_tmp_, hud_img_, con, 16);
+        }
+        if (fsr1_.frames++ == 0) LOGI(kTag, "upscaler: FSR 1 %s, %dx%d -> %dx%d", rcas ? "EASU + RCAS" : "EASU", f.width, f.height, hud_w_, hud_h_);
+        return true;
+    }
+#endif  // DSR_HAVE_FSR1
+    Image hud_img_;                 // the game's frame enlarged to the screen, with the HUD drawn on it
+    int hud_w_ = 0, hud_h_ = 0;     // its size (0 = hud_full_res not in use)
+    int hud_src_w_ = 0, hud_src_h_ = 0;  // the game frame size it was sized from
+    Image hud2_img_;                // the final pass's output at the screen's size (when the HUD target is not presented)
+    uint64_t hud_t_addr_ = 0;       // the target the current picture was enlarged from (the one the HUD is drawn on)
+    uint64_t hud_cand_addr_ = 0;    // this frame: a HUD draw was seen on this target, not yet known as a source
+    std::unordered_set<uint64_t> hud_sources_;  // HUD targets that reach the screen (learned), see Draw
+    int hud_orphans_ = 0;
+    bool hud_final_ = false;        // this frame's final pass was drawn into hud2_img_ (reset by Present)
+    bool hud_started_ = false;      // this frame's HUD goes into hud_img_ (reset by Present)
+    uint64_t hud_redirected_ = 0;
+    std::unordered_set<uint64_t> presented_addrs_;  // frame textures the game has presented
+    int win_w_ = 0, win_h_ = 0;     // the window's size (EnsureSwapchain)
     bool bc_patched_ = false, bc_forced_ = false;
     bool mip_skip_ = false;      // settings texture_mip_skip
+    bool shadow_skip_logged_ = false;
+    // Depth images whose pass was left out as a shadow map (shadow_quality 0): address and size, so a different image
+    // that later lands on the same memory is not taken for one.
+    std::unordered_set<uint64_t> shadow_maps_;
+    static uint64_t ShadowMapKey(const Image& i) { return i.addr | (uint64_t(i.width) << 44); }
+    int astc_ui_kept_ = 0;
+    // skip_fs (settings): hex fragment-program hashes separated by commas
+    bool skip_parsed_ = false;
+    std::unordered_set<uint64_t> skip_fs_, skip_logged_;
+    std::unordered_set<uint64_t> depth_sampled_;     // depth images (by address) some draw has read as a texture
+    std::unordered_set<uint64_t> skip_kept_logged_;  // skip_post programs kept because they write such a depth
+    uint64_t post_depth_draws_ = 0;                  // ... and their draws made without colour (log)
+    uint64_t post_depth_hidden_ = 0;                 // ... of those, left out by skip_hidden (not visible)
+    // skip_post hashes: only left out on small targets (see the skip_fs block of the draw); a full-size pass is the
+    // frame itself (tone mapping / final composite) and skipping it leaves the picture black.
+    std::unordered_set<uint64_t> skip_post_;
+    std::unordered_set<uint64_t> skip_white_;  // skip_white (settings): skipped like skip_post, target filled with white
+    uint64_t world_max_area_ = 0;  // biggest colour target drawn together with a depth buffer (the 3D world)
+    uint64_t game_frame_area_ = 0;  // pixels of the frame the game presents (the world is never bigger)
+    uint64_t skipped_draws_ = 0;
+    void ParseSkipList() {
+        skip_parsed_ = true;
+        // skip_bloom (settings): the glow chain of the post-processing (from a frame capture on a Mali-G57: a bright
+        // pass and the blurs at 192x108 / 96x54 that feed the final composite). The downsample shared with the depth
+        // of field (8801d1d8f9f8273b) is left alone.
+        std::string s = dsr::GetRuntime().config.skip_fs;
+        if (dsr::GetRuntime().config.skip_bloom)
+            s += ",c3d56b6401ccb572,512397bbc420f850,9b44066e84ff04c6,82aa25701a19c22b";
+        // skip_post (settings, experimental): the other post-processing programs that run about once per frame on
+        // the small targets (356x164 / 178x82 at render scale 0.45), taken from the census in a gameplay log on a
+        // Mali-G57. Left alone: the exposure passes (16x16), the downsample shared with the depth of field
+        // (8801d1d8f9f8273b) and the programs drawn many times per frame (probably geometry, not full-screen passes).
+        // Tested on a Mali-G57 (A15): these 7 passes (all on 178x82 targets) can be left out with the picture intact.
+        // fcb25d171a89d84a and 7a6ad6744d3bc95b (356x164) turn the picture black, as do the programs that also run
+        // at full size (3fc1b1baa8114318, cb9cc6ab42dc6039), so they are no longer in the list.
+        std::string post;
+        if (dsr::GetRuntime().config.skip_post)
+            post += "9f81cfa55dca6f0d,cdeb232ada05c0af,f503d9c09783ac14,8ca165723b7765a5,"
+                    "e9bc8856f5b546f7,4f821636b20a5c3c,de34cd7d8f37f809";
+        // skip_post_plus (menu): 16 more programs found with the "post census" log line and checked on a Mali-G57:
+        // the picture stays intact. NOT in the list (they damage the picture when left out): e4eb576b6a6d76cb,
+        // 0fbd542ccb790473 (many draws at half size) and 8801d1d8f9f8273b (the depth of field's reduction chain).
+        if (dsr::GetRuntime().config.skip_post_plus)
+            post += ",e0501de054200176,8cb790d204a0b39b,ae56562970def45d,863999b2a21dc90c,55a19a4b0e538174,"
+                    "6442da6e33db1cda,c6fe85bf3e29c5ac,445192121db07e80,a4224b32af5663fb,b678984deebf8b58,"
+                    "aac88c6f83f5d42d,9a14cd3d05151bb4,695ae6e55b830962,6a340d1cf0e6ed13,587cd12af99567bb,"
+                    "527cbc3c4a0d722b";
+        // skip_post_extra (settings): more hashes with the same small-targets-only rule, to try passes from the
+        // "post census" log line without rebuilding.
+        if (!dsr::GetRuntime().config.skip_post_extra.empty()) post += "," + dsr::GetRuntime().config.skip_post_extra;
+        // skip_white (settings): the same rule, but the skipped target is filled with white instead of zero (masks).
+        if (!dsr::GetRuntime().config.skip_white.empty()) post += "," + dsr::GetRuntime().config.skip_white;
+        auto parse = [&](const std::string& list, std::unordered_set<uint64_t>& out) {
+            size_t at = 0;
+            while (at < list.size()) {
+                size_t end = list.find_first_of(", ;", at);
+                if (end == std::string::npos) end = list.size();
+                if (end > at) {
+                    char* stop = nullptr;
+                    const std::string tok = list.substr(at, end - at);
+                    const unsigned long long h = std::strtoull(tok.c_str(), &stop, 16);
+                    if (stop && *stop == 0 && h) out.insert(h);
+                    else LOGW(kTag, "skip_fs: '%s' is not a hash", tok.c_str());
+                }
+                at = end + 1;
+            }
+        };
+        parse(s, skip_fs_);
+        parse(post, skip_post_);
+        parse(dsr::GetRuntime().config.skip_white, skip_white_);
+        if (!skip_white_.empty())
+            LOGI(kTag, "skip_white: %zu fragment programs are left out and their target is filled with white",
+                 skip_white_.size());
+        if (!skip_fs_.empty() || !skip_post_.empty())
+            LOGI(kTag, "skip_fs: %zu fragment programs are left out (+%zu skip_post, small targets only)", skip_fs_.size(),
+                 skip_post_.size());
+    }
+    // Diagnostics (profile on): which image each program writes on the small targets, and what it samples, once per
+    // program and image: the draws of a skipped program and the real draws that write the same images.
+    std::unordered_set<uint64_t> diag_seen_;
+    int diag_lines_ = 0;
+    void SkipDiag(const DrawParams& p, const std::vector<Image*>& colors, const Image* depth, Shader* fs, bool skipped) {
+        if (diag_lines_ >= 160 || colors.empty() || !colors[0] || !st_.program[1] || !fs) return;
+        const Image* c = colors[0];
+        const uint64_t h = st_.program[1]->hash;
+        const uint64_t k = h ^ (c->addr * 0x9E3779B97F4A7C15ull) ^ (skipped ? (1ull << 63) : 0);
+        if (!diag_seen_.insert(k).second) return;
+        diag_lines_++;
+        std::string tex;
+        for (uint32_t slot = 0; slot < 32; slot++) {
+            if (!(fs->info.texture_mask >> slot & 1)) continue;
+            BoundTexture bt = st_.textures[1][slot];
+            if (!bt.valid) bt = HandleFromUniforms(1, slot);
+            char b[112];
+            if (bt.valid)
+                snprintf(b, sizeof b, " s%u=%dx%d f%d @%llx", slot, bt.texture.tex.width, bt.texture.tex.height,
+                         bt.texture.tex.format, (unsigned long long)bt.texture.addr);
+            else
+                snprintf(b, sizeof b, " s%u=?", slot);
+            tex += b;
+        }
+        char d[112] = "none";
+        if (depth)
+            snprintf(d, sizeof d, "%dx%d @%llx test %d write %d", depth->width, depth->height,
+                     (unsigned long long)depth->addr, int(st_.depth.depth_test), int(st_.depth.depth_write));
+        LOGI(kTag, "skip_diag: %s %016llx -> %dx%d @%llx fmt %d, %zu colour target(s), blend %d, depth %s, mode %d count %d inst %d |%s",
+             skipped ? "SKIPPED" : "drawn  ", (unsigned long long)h, c->width, c->height, (unsigned long long)c->addr,
+             c->nvn_format, colors.size(), int(st_.color.blend_enable != 0), d, p.mode, p.count, p.instances, tex.c_str());
+    }
+    void ZeroSkippedTarget(Image& img, size_t i, bool white = false) {
+        if (img.skip_zeroed && img.skip_fill_white == white) return;
+        img.skip_zeroed = true;
+        img.skip_fill_white = white;
+        VkClearValue fill{};  // zero, or white (1.0 in every channel) for a skip_white program
+        if (white) fill.color.float32[0] = fill.color.float32[1] = fill.color.float32[2] = fill.color.float32[3] = 1.0f;
+        const auto sub_rt = RtSub(i);
+        // The target is an attachment of the open pass: zero it inside the pass (as the game's own clears of an open
+        // pass's target are done) instead of ending the pass for it. A pass ended just to zero a skipped pass's
+        // target was one of the most frequent breaks in the log (the line of this EndRendering).
+        if (rendering_ && !capture_active_ && i < pass_color_count_ && pass_colors_[i] == &img &&
+            pass_color_sub_[i] == std::make_pair(sub_rt.first, sub_rt.second)) {
+            VkClearAttachment ca{VK_IMAGE_ASPECT_COLOR_BIT, uint32_t(i), fill};
+            const VkClearRect rect{{{0, 0}, pass_extent_}, 0, 1};
+            Rec([ca, rect](VkCommandBuffer cb) { vkCmdClearAttachments(cb, 1, &ca, 1, &rect); });
+            clears_in_pass_++;
+            img.written = true;
+            img.cpu_source = false;
+            return;
+        }
+        if (InOpenPass(&img)) EndRendering();
+        if (img.clear_pending && !DeadClear(img, VK_IMAGE_ASPECT_COLOR_BIT, sub_rt.first, sub_rt.second))
+            FlushClear(img);
+        img.clear_pending = true;
+        img.clear_value = fill;
+        img.clear_aspect = VK_IMAGE_ASPECT_COLOR_BIT;
+        img.clear_layer = sub_rt.first;
+        img.clear_level = sub_rt.second;
+        img.written = true;     // (never uploaded from the game's memory when sampled)
+        img.cpu_source = false;
+    }
     uint64_t mip_skipped_ = 0;   // images created without their top level
     int hud_box_w_ = 0, hud_box_h_ = 0;
     std::unordered_set<uint64_t> hud_box_logged_;
@@ -6316,6 +8671,17 @@ private:
     int captures_done_ = 0;
     std::atomic<int64_t> capture_request_ms_{0};
     uint32_t capture_pass_ = 0, pass_draws_ = 0;
+    // One line per pass in the capture's "pass table" (GPU ms, target, draws, fragment programs).
+    struct PassInfo {
+        uint32_t pass = 0, draws = 0, distinct_fs = 0;
+        uint64_t fs_first = 0, fs_last = 0;
+        std::string target;
+    };
+    std::vector<PassInfo> pass_infos_;
+    uint64_t pass_fs_first_ = 0;
+    uint32_t pass_distinct_fs_ = 0;
+    uint64_t pass_fs_seen_[8] = {};
+    std::string pass_target_;
     uint64_t pass_fs_hash_ = 0, last_list_draws_ = 0, list_start_draws_ = 0;
     uint64_t pass_fs_addr_ = 0, pass_vs_addr_ = 0;
     std::chrono::steady_clock::time_point next_capture_;
@@ -6329,7 +8695,14 @@ private:
     uint64_t render_passes_ = 0, barriers_ = 0;
     std::map<int, uint64_t> pass_breaks_;
     std::map<std::string, uint64_t> sampled_breaks_;
+    std::map<std::string, uint64_t> copy_counts_;  // image copies (each ends the open pass), by formats and sizes
+    // Post-processing census (diagnostics, settings profile): draws per (fragment program, target size) on targets
+    // clearly smaller than the biggest one drawn to, so the passes of a post chain can be picked for skip_fs.
+    std::map<std::pair<uint64_t, uint64_t>, uint64_t> post_census_;
+    uint64_t census_max_area_ = 0;
     std::vector<uint32_t> query_pass_;
+    std::vector<uint64_t> query_fs_;     // fragment program of each capture query
+    std::vector<uint32_t> query_verts_;  // vertices (count x instances) of each capture query's draw
     uint64_t ubo_desc_draw_ = ~0ull;
     int world_draws_logged_ = 0;
     struct DrawImage {
@@ -6349,6 +8722,7 @@ private:
     std::unordered_set<uint64_t> viewport_keys_;
     std::set<std::string> view_mismatch_logged_;
     uint64_t view_standins_ = 0;
+    uint64_t zero_standins_ = 0;  // skip_fs: reads of a zeroed skipped-pass target served by a black stand-in
     int capture_draws_logged_ = 0;
     int geo_dumps_ = 0;
     std::unordered_map<uint64_t, uint64_t> snapshot_gen_;
@@ -6391,6 +8765,10 @@ private:
         bool pending = false;
         std::vector<Readback> readbacks;
         VkQueryPool ts = VK_NULL_HANDLE;  // GPU time of the submission (start, end)
+        VkQueryPool occ = VK_NULL_HANDLE;  // settings skip_hidden: one occlusion query per tracked draw
+        std::vector<uint64_t> occ_keys;    // render thread: the draw behind each query of this submission
+        std::vector<uint32_t> occ_area;    // render thread: the pixels of the depth target of each of those draws
+        uint32_t occ_used = 0;
         bool ts_written = false;
         VkDescriptorPool pool = VK_NULL_HANDLE;
         std::vector<VkDescriptorPool> extra_pools;  // when `pool` fills up (recorder thread)

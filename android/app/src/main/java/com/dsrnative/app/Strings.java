@@ -205,11 +205,116 @@ final class Strings {
                 "자동은 기기가 유지할 수 있는 60, 30, 20 FPS 중에서 고르며 게임 속도는 정상으로 유지합니다.",
                 "自动会根据设备的承受能力选择 60、30 或 20 FPS，并保持游戏正常速度。",
                 "自動會依裝置可維持的程度選擇 60、30 或 20 FPS，並保持遊戲正常速度。");
+        put("minfps_t", "Lowest auto frame rate", "Plus bas en mode Auto", "Niedrigste Auto-Bildrate",
+                "Frame rate minimo in Auto", "Mínimo en modo Auto", "Mínimo no modo Auto",
+                "Минимум в режиме Авто", "自動の最低フレームレート", "자동 최저 프레임 속도", "自动模式最低帧率", "自動模式最低幀率");
+        put("minfps_n", "Only with Auto: the slowest rate Auto may drop to. Lower looks smoother on weak devices, but the game runs slower.",
+                "Seulement avec Auto : le taux le plus bas qu'Auto peut atteindre. Plus bas = plus fluide sur les appareils faibles, mais jeu plus lent.",
+                "Nur bei Auto: die niedrigste Rate, auf die Auto fallen darf. Niedriger wirkt flüssiger auf schwachen Geräten, das Spiel läuft dafür langsamer.",
+                "Solo con Auto: la velocità più bassa a cui Auto può scendere. Più bassa = più fluida sui dispositivi deboli, ma gioco più lento.",
+                "Solo con Auto: la velocidad más baja a la que puede bajar Auto. Más baja = más fluida en equipos débiles, pero el juego va más lento.",
+                "Só com Auto: a menor taxa a que o Auto pode cair. Mais baixa = mais fluida em aparelhos fracos, mas o jogo fica mais lento.",
+                "Только для Авто: самая низкая частота, до которой может опускаться Авто. Ниже — плавнее на слабых устройствах, но игра замедляется.",
+                "自動のときのみ：自動が下げる最低のレートです。低いほど弱い機種で滑らかですが、ゲームは遅くなります。",
+                "자동일 때만: 자동이 내려갈 수 있는 최저 속도입니다. 낮을수록 약한 기기에서 부드럽지만 게임이 느려집니다.",
+                "仅自动模式：自动可降到的最低帧率。越低在弱机上越流畅，但游戏会变慢。",
+                "僅自動模式：自動可降到的最低幀率。越低在弱機上越流暢，但遊戲會變慢。");
+        put("scalef_t", "Upscale filter", "Filtre d'agrandissement", "Vergrößerungsfilter", "Filtro di ingrandimento",
+                "Filtro de ampliación", "Filtro de ampliação", "Фильтр увеличения", "拡大フィルター", "확대 필터", "放大滤镜", "放大濾鏡");
+        put("scalef_n", "Smooths the enlarged picture (bilinear) or keeps pixels sharp (nearest). Bicubic and FXAA need shaders: not yet.",
+                "Lisse l'image agrandie (bilinéaire) ou garde les pixels nets (proche). Bicubique et FXAA demandent des shaders : pas encore.",
+                "Glättet das vergrößerte Bild (bilinear) oder hält die Pixel scharf (nächster Nachbar). Bikubisch und FXAA brauchen Shader: noch nicht.",
+                "Leviga l'immagine ingrandita (bilineare) o mantiene i pixel nitidi (vicino). Bicubico e FXAA richiedono shader: non ancora.",
+                "Suaviza la imagen ampliada (bilineal) o mantiene los píxeles nítidos (vecino). Bicúbico y FXAA necesitan shaders: aún no.",
+                "Suaviza a imagem ampliada (bilinear) ou mantém os pixels nítidos (vizinho). Bicúbico e FXAA precisam de shaders: ainda não.",
+                "Сглаживает увеличенное изображение (билинейный) или сохраняет пиксели четкими (ближайший). Бикубический и FXAA требуют шейдеров: пока нет.",
+                "拡大画像を滑らかにします（バイリニア）。ピクセルを鮮明に保つ場合はニアレスト。バイキュービックとFXAAはシェーダーが必要で、まだ未対応です。",
+                "확대된 화면을 부드럽게(바이리니어) 또는 픽셀을 선명하게(니어리스트) 유지합니다. 바이큐빅과 FXAA는 셰이더가 필요해 아직 없습니다.",
+                "平滑放大后的画面（双线性），或保持像素锐利（最近邻）。双三次和FXAA需要着色器，暂不可用。",
+                "平滑放大後的畫面（雙線性），或保持像素銳利（最近鄰）。雙三次和FXAA需要著色器，暫不可用。");
+        put("hudres_t", "Sharp HUD and menus", "HUD et menus nets", "Scharfes HUD und Menüs", "HUD e menu nitidi",
+                "HUD y menús nítidos", "HUD e menus nítidos", "Четкий HUD и меню", "HUDとメニューを鮮明に", "선명한 HUD와 메뉴",
+                "清晰的HUD和菜单", "清晰的HUD和選單");
+        put("hudres_n",
+                "Draws the game's HUD, menus and text at the screen's full resolution, whatever the render scale. Costs a little GPU time.",
+                "Dessine l'interface, les menus et les textes du jeu à la résolution complète de l'écran, quelle que soit l'échelle de rendu. Coûte un peu de GPU.",
+                "Zeichnet HUD, Menüs und Texte des Spiels in der vollen Bildschirmauflösung, unabhängig von der Render-Skalierung. Kostet etwas GPU-Zeit.",
+                "Disegna HUD, menu e testi del gioco alla risoluzione piena dello schermo, qualunque sia la scala di rendering. Costa un po' di GPU.",
+                "Dibuja el HUD, los menús y los textos del juego a la resolución completa de la pantalla, sea cual sea la escala de renderizado. Cuesta algo de GPU.",
+                "Desenha o HUD, os menus e os textos do jogo na resolução total da tela, seja qual for a escala de renderização. Custa um pouco de GPU.",
+                "Рисует HUD, меню и текст игры в полном разрешении экрана независимо от масштаба рендера. Немного нагружает GPU.",
+                "ゲームのHUD・メニュー・文字を、レンダースケールに関係なく画面の最大解像度で描画します。GPU負荷が少し増えます。",
+                "렌더 스케일과 관계없이 게임의 HUD, 메뉴, 텍스트를 화면 전체 해상도로 그립니다. GPU를 조금 더 사용합니다.",
+                "无论渲染比例如何，都以屏幕的完整分辨率绘制游戏的HUD、菜单和文字。会略微增加GPU负担。",
+                "無論渲染比例如何，都以螢幕的完整解析度繪製遊戲的HUD、選單和文字。會略微增加GPU負擔。");
+        put("scalef_0", "Nearest", "Pixels nets", "Nächster Nachbar", "Vicino", "Vecino más cercano", "Vizinho mais próximo",
+                "Ближайший", "ニアレスト", "니어리스트", "最近邻", "最近鄰");
+        put("scalef_1", "Bilinear", "Bilinéaire", "Bilinear", "Bilineare", "Bilineal", "Bilinear", "Билинейный",
+                "バイリニア", "바이리니어", "双线性", "雙線性");
         put("tab_graphics", "Graphics", "Graphismes", "Grafik", "Grafica", "Gráficos", "Gráficos", "Графика", "グラフィック",
                 "그래픽", "图形", "圖形");
         put("sec_game", "Game", "Jeu", "Spiel", "Gioco", "Juego", "Jogo", "Игра", "ゲーム", "게임", "游戏", "遊戲");
         put("sec_quality", "Quality", "Qualité", "Qualität", "Qualità", "Calidad", "Qualidade", "Качество", "画質", "품질",
                 "画质", "畫質");
+        // en, fr, de, it, es, pt (other languages show the English text)
+        put("shadow_t", "Shadows", "Ombres", "Schatten", "Ombre", "Sombras", "Sombras");
+        put("shadow_n",
+                "Shadow map quality. Off skips the shadow pass completely: the biggest saving on weak GPUs.",
+                "Qualité des cartes d'ombres. Désactivé supprime entièrement la passe d'ombres : le plus gros gain sur les GPU faibles.",
+                "Qualität der Schattenkarten. Aus überspringt die Schattenpassage komplett: die größte Ersparnis bei schwachen GPUs.",
+                "Qualità delle mappe d'ombra. Disattivato salta del tutto il passaggio delle ombre: il risparmio maggiore sulle GPU deboli.",
+                "Calidad de los mapas de sombras. Desactivado omite por completo el pase de sombras: el mayor ahorro en GPUs débiles.",
+                "Qualidade dos mapas de sombra. Desligado ignora totalmente a passagem de sombras: a maior economia em GPUs fracas.");
+        put("q_high", "High (2048)", "Élevée (2048)", "Hoch (2048)", "Alta (2048)", "Alta (2048)", "Alta (2048)");
+        put("q_medium", "Medium (1024)", "Moyenne (1024)", "Mittel (1024)", "Media (1024)", "Media (1024)", "Média (1024)");
+        put("q_low", "Low (512)", "Faible (512)", "Niedrig (512)", "Bassa (512)", "Baja (512)", "Baixa (512)");
+        put("q_off", "Off", "Désactivé", "Aus", "Disattivato", "Desactivadas", "Desligado");
+        put("loweff_t", "Low-quality effects", "Effets basse qualité", "Effekte in niedriger Qualität",
+                "Effetti a bassa qualità", "Efectos de baja calidad", "Efeitos de baixa qualidade");
+        put("loweff_n",
+                "Smoke, fog and glow use the game's cheaper path.",
+                "Fumée, brouillard et lueurs utilisent le chemin moins coûteux du jeu.",
+                "Rauch, Nebel und Leuchten nutzen den günstigeren Weg des Spiels.",
+                "Fumo, nebbia e bagliori usano il percorso più leggero del gioco.",
+                "Humo, niebla y brillos usan la ruta más ligera del juego.",
+                "Fumaça, névoa e brilhos usam o caminho mais leve do jogo.");
+        put("up_t", "Upscaler", "Upscaleur", "Hochskalierer", "Upscaler", "Escalador", "Escalador");
+        put("up_n",
+                "How the 3D picture is enlarged. FSR 1 rebuilds edges better at a low 3D resolution but costs GPU time. Needs 'HUD at full resolution'.",
+                "Comment l'image 3D est agrandie. FSR 1 reconstruit mieux les contours à basse résolution mais coûte du GPU. Demande 'HUD en pleine résolution'.",
+                "Wie das 3D-Bild vergrößert wird. FSR 1 rekonstruiert Kanten bei niedriger Auflösung besser, kostet aber GPU-Zeit. Braucht 'HUD in voller Auflösung'.",
+                "Come viene ingrandita l'immagine 3D. FSR 1 ricostruisce meglio i bordi a bassa risoluzione ma costa GPU. Richiede 'HUD a piena risoluzione'.",
+                "Cómo se agranda la imagen 3D. FSR 1 reconstruye mejor los bordes con poca resolución, pero cuesta GPU. Requiere 'HUD a resolución completa'.",
+                "Como a imagem 3D é ampliada. O FSR 1 reconstrói melhor as bordas em baixa resolução, mas custa GPU. Requer 'HUD em resolução total'.");
+        put("up_0", "Plain scaling", "Agrandissement simple", "Einfache Skalierung", "Ingrandimento semplice", "Escalado simple", "Escala simples");
+        put("up_1", "FSR 1 (EASU)", "FSR 1 (EASU)", "FSR 1 (EASU)", "FSR 1 (EASU)", "FSR 1 (EASU)", "FSR 1 (EASU)");
+        put("up_2", "FSR 1 + sharpening", "FSR 1 + netteté", "FSR 1 + Schärfe", "FSR 1 + nitidezza", "FSR 1 + nitidez", "FSR 1 + nitidez");
+        put("fxaa_t", "FXAA", "FXAA", "FXAA", "FXAA", "FXAA", "FXAA", "FXAA", "FXAA", "FXAA", "FXAA", "FXAA");
+        put("fxaa_n",
+                "Smooths jagged edges of the 3D picture before it is enlarged (FXAA 3.11). Fast is the light one, for Mali GPUs. Needs 'HUD at full resolution'.",
+                "Lisse les bords crénelés de l'image 3D avant son agrandissement (FXAA 3.11). Rapide est la version légère, pour les GPU Mali. Demande 'HUD en pleine résolution'.",
+                "Glättet Kanten des 3D-Bilds vor dem Vergrößern (FXAA 3.11). Schnell ist die leichte Variante für Mali-GPUs. Braucht 'HUD in voller Auflösung'.",
+                "Leviga i bordi seghettati dell'immagine 3D prima dell'ingrandimento (FXAA 3.11). Veloce è la versione leggera, per GPU Mali. Richiede 'HUD a piena risoluzione'.",
+                "Suaviza los bordes dentados de la imagen 3D antes de ampliarla (FXAA 3.11). Rápido es la versión ligera, para GPU Mali. Necesita 'HUD a resolución completa'.",
+                "Suaviza as bordas serrilhadas da imagem 3D antes de ampliá-la (FXAA 3.11). Rápido é a versão leve, para GPUs Mali. Precisa de 'HUD em resolução total'.");
+        put("fxaa_fast", "Fast (Mali)", "Rapide (Mali)", "Schnell (Mali)", "Veloce (Mali)", "Rápido (Mali)", "Rápido (Mali)");
+        put("fxaa_quality", "Quality", "Qualité", "Qualität", "Qualità", "Calidad", "Qualidade");
+        put("hudmax_t", "Picture height limit", "Hauteur maximale de l'image", "Maximale Bildhöhe", "Altezza massima immagine", "Altura máxima de la imagen", "Altura máxima da imagem");
+        put("hudmax_n",
+                "Caps the enlarged picture and HUD at this many lines; Android stretches it to the screen. Fewer pixels for FSR and the HUD on a weak GPU (Mali). Needs 'HUD at full resolution'.",
+                "Limite l'image agrandie et le HUD à ce nombre de lignes ; Android l'étire à l'écran. Moins de pixels pour FSR et le HUD sur un GPU faible (Mali). Demande 'HUD en pleine résolution'.",
+                "Begrenzt das vergrößerte Bild samt HUD auf so viele Zeilen; Android streckt es auf den Bildschirm. Weniger Pixel für FSR und HUD auf schwacher GPU (Mali). Braucht 'HUD in voller Auflösung'.",
+                "Limita l'immagine ingrandita e l'HUD a queste righe; Android la estende allo schermo. Meno pixel per FSR e HUD su una GPU debole (Mali). Richiede 'HUD a piena risoluzione'.",
+                "Limita la imagen ampliada y el HUD a estas líneas; Android la estira a la pantalla. Menos píxeles para FSR y el HUD en una GPU débil (Mali). Necesita 'HUD a resolución completa'.",
+                "Limita a imagem ampliada e o HUD a este número de linhas; o Android estica para a tela. Menos pixels para o FSR e o HUD numa GPU fraca (Mali). Precisa de 'HUD em resolução total'.");
+        put("hudmax_0", "No limit", "Sans limite", "Kein Limit", "Nessun limite", "Sin límite", "Sem limite");
+        put("sharp_t", "FSR sharpness", "Netteté FSR", "FSR-Schärfe", "Nitidezza FSR", "Nitidez de FSR", "Nitidez do FSR");
+        put("sharp_n", "RCAS sharpening after the upscaling (only with 'FSR 1 + sharpening').",
+                "Netteté RCAS après l'agrandissement (seulement avec 'FSR 1 + netteté').",
+                "RCAS-Schärfung nach dem Hochskalieren (nur mit 'FSR 1 + Schärfe').",
+                "Nitidezza RCAS dopo l'ingrandimento (solo con 'FSR 1 + nitidezza').",
+                "Nitidez RCAS tras el escalado (solo con 'FSR 1 + nitidez').",
+                "Nitidez RCAS após a ampliação (apenas com 'FSR 1 + nitidez').");
         put("perf_t", "Performance mode", "Mode performance", "Leistungsmodus", "Modalità prestazioni",
                 "Modo rendimiento", "Modo desempenho", "Режим производительности", "パフォーマンスモード", "성능 모드",
                 "性能模式", "效能模式");
@@ -253,6 +358,107 @@ final class Strings {
                 "BC를 지원하지 않는 GPU에서 텍스처 메모리가 4분의 1로 줄어듭니다. 약간 손실이 있습니다.",
                 "在不支持 BC 的 GPU 上纹理内存减少至 1/4；略有损失。",
                 "在不支援 BC 的 GPU 上紋理記憶體減少至 1/4；略有損失。");
+        put("astc_t", "BC textures as ASTC instead of ETC2",
+                "Textures BC en ASTC au lieu d'ETC2",
+                "BC-Texturen als ASTC statt ETC2",
+                "Texture BC in ASTC invece di ETC2",
+                "Texturas BC en ASTC en lugar de ETC2",
+                "Texturas BC em ASTC em vez de ETC2");
+        put("astc_n",
+                "BC1 and BC3 textures are re-encoded as ASTC 4x4 (8 bits per texel; BC1 takes twice the memory it does in ETC2, but stays closer to the original and keeps alpha exact). Needs a GPU with ASTC, such as Mali.",
+                "Les textures BC1 et BC3 sont réencodées en ASTC 4x4 (8 bits par texel ; le BC1 prend deux fois plus de mémoire qu'en ETC2, mais reste plus fidèle et garde l'alpha exact). Nécessite un GPU avec ASTC, comme Mali.",
+                "BC1- und BC3-Texturen werden als ASTC 4x4 neu kodiert (8 Bit pro Texel; BC1 braucht doppelt so viel Speicher wie in ETC2, bleibt aber näher am Original und behält Alpha exakt). Benötigt eine GPU mit ASTC, z. B. Mali.",
+                "Le texture BC1 e BC3 vengono ricodificate in ASTC 4x4 (8 bit per texel; il BC1 usa il doppio della memoria rispetto a ETC2, ma resta più fedele e mantiene l'alpha esatto). Richiede una GPU con ASTC, come Mali.",
+                "Las texturas BC1 y BC3 se recodifican en ASTC 4x4 (8 bits por texel; BC1 ocupa el doble de memoria que en ETC2, pero queda más fiel al original y conserva el alfa exacto). Requiere una GPU con ASTC, como Mali.",
+                "As texturas BC1 e BC3 são recodificadas em ASTC 4x4 (8 bits por texel; o BC1 usa o dobro da memória do ETC2, mas fica mais fiel ao original e mantém o alfa exato). Requer uma GPU com ASTC, como a Mali.");
+        // en, fr, de, it, es, pt (other languages show the English text)
+        put("astcb_t", "ASTC block size", "Taille de bloc ASTC", "ASTC-Blockgröße", "Dimensione blocco ASTC",
+                "Tamaño de bloque ASTC", "Tamanho do bloco ASTC");
+        put("astcb_n",
+                "For textures converted to ASTC. Bigger blocks take much less memory and bandwidth but lose detail; cut-out alpha (leaves, fences) suffers most.",
+                "Pour les textures converties en ASTC. Des blocs plus grands prennent beaucoup moins de mémoire et de bande passante mais perdent des détails ; l'alpha découpé (feuilles, grilles) en souffre le plus.",
+                "Für nach ASTC umgewandelte Texturen. Größere Blöcke brauchen viel weniger Speicher und Bandbreite, verlieren aber Details; ausgeschnittenes Alpha (Blätter, Zäune) leidet am meisten.",
+                "Per le texture convertite in ASTC. Blocchi più grandi usano molta meno memoria e banda ma perdono dettaglio; l'alpha ritagliato (foglie, recinzioni) ne risente di più.",
+                "Para las texturas convertidas a ASTC. Los bloques grandes usan mucha menos memoria y ancho de banda, pero pierden detalle; el alfa recortado (hojas, rejas) es lo que más sufre.",
+                "Para texturas convertidas em ASTC. Blocos maiores usam muito menos memória e largura de banda, mas perdem detalhe; o alfa recortado (folhas, cercas) sofre mais.");
+        put("astcb_4", "4x4 (8 bits/texel, best)", "4x4 (8 bits/texel, meilleur)", "4x4 (8 Bit/Texel, beste)",
+                "4x4 (8 bit/texel, migliore)", "4x4 (8 bits/texel, mejor)", "4x4 (8 bits/texel, melhor)");
+        put("astcb_6", "6x6 (3.6 bits/texel)", "6x6 (3,6 bits/texel)", "6x6 (3,6 Bit/Texel)", "6x6 (3,6 bit/texel)",
+                "6x6 (3,6 bits/texel)", "6x6 (3,6 bits/texel)");
+        put("astcb_8", "8x8 (2 bits/texel, smallest)", "8x8 (2 bits/texel, le plus petit)", "8x8 (2 Bit/Texel, kleinste)",
+                "8x8 (2 bit/texel, il più piccolo)", "8x8 (2 bits/texel, el más pequeño)", "8x8 (2 bits/texel, o menor)");
+        put("bc5_t", "BC5 textures as ASTC", "Textures BC5 en ASTC", "BC5-Texturen als ASTC", "Texture BC5 in ASTC",
+                "Texturas BC5 en ASTC", "Texturas BC5 em ASTC");
+        put("bc5_n",
+                "Normal maps (BC5, 16 bits per texel once decoded) are re-encoded as ASTC at the block size above: half the memory at 4x4, an eighth at 8x8. Needs a GPU with ASTC, such as Mali.",
+                "Les normal maps (BC5, 16 bits par texel décodées) sont réencodées en ASTC à la taille de bloc ci-dessus : moitié de mémoire en 4x4, un huitième en 8x8. Nécessite un GPU avec ASTC, comme Mali.",
+                "Normal Maps (BC5, 16 Bit pro Texel decodiert) werden in der obigen Blockgröße als ASTC neu kodiert: halber Speicher bei 4x4, ein Achtel bei 8x8. Benötigt eine GPU mit ASTC, z. B. Mali.",
+                "Le normal map (BC5, 16 bit per texel decodificate) vengono ricodificate in ASTC con la dimensione di blocco sopra: metà memoria a 4x4, un ottavo a 8x8. Richiede una GPU con ASTC, come Mali.",
+                "Los mapas de normales (BC5, 16 bits por texel decodificados) se recodifican en ASTC con el tamaño de bloque de arriba: la mitad de memoria en 4x4, un octavo en 8x8. Requiere una GPU con ASTC, como Mali.",
+                "Os mapas de normais (BC5, 16 bits por texel decodificados) são recodificados em ASTC com o tamanho de bloco acima: metade da memória em 4x4, um oitavo em 8x8. Requer uma GPU com ASTC, como a Mali.");
+        put("aniso_t", "Anisotropic filtering", "Filtrage anisotrope", "Anisotrope Filterung",
+                "Filtro anisotropico", "Filtrado anisotrópico", "Filtragem anisotrópica");
+        put("aniso_n",
+                "Limit on the game's texture filtering at oblique angles. Lower is faster on weaker GPUs.",
+                "Limite du filtrage des textures sous des angles obliques. Plus bas = plus rapide sur les GPU modestes.",
+                "Obergrenze für die Texturfilterung bei schrägen Winkeln. Niedriger ist auf schwächeren GPUs schneller.",
+                "Limite del filtraggio delle texture ad angoli obliqui. Più basso = più veloce sulle GPU deboli.",
+                "Límite del filtrado de texturas en ángulos oblicuos. Más bajo es más rápido en GPU modestas.",
+                "Limite da filtragem de texturas em ângulos oblíquos. Mais baixo é mais rápido em GPUs fracas.");
+        put("bloom_t", "Remove bloom", "Supprimer le bloom", "Bloom entfernen", "Rimuovi il bloom", "Quitar el bloom",
+                "Remover o bloom");
+        put("bloom_n",
+                "Skips the glow post-processing chain: faster on weak GPUs, but without the glow around bright lights.",
+                "Saute la chaîne de post-traitement du halo : plus rapide sur les GPU modestes, mais sans le halo autour des lumières vives.",
+                "Überspringt die Glühen-Nachbearbeitung: schneller auf schwachen GPUs, aber ohne Leuchten um helle Lichter.",
+                "Salta la catena di post-elaborazione dell'alone: più veloce sulle GPU deboli, ma senza l'alone attorno alle luci intense.",
+                "Omite la cadena de posprocesado del resplandor: más rápido en GPU modestas, pero sin el brillo alrededor de las luces intensas.",
+                "Pula a cadeia de pós-processamento do brilho: mais rápido em GPUs fracas, mas sem o brilho ao redor de luzes fortes.");
+        put("post_t", "Remove extra post-processing (experimental)", "Supprimer le post-traitement supplémentaire (expérimental)",
+                "Zusätzliche Nachbearbeitung entfernen (experimentell)", "Rimuovi la post-elaborazione extra (sperimentale)",
+                "Quitar el posprocesado extra (experimental)", "Remover o pós-processamento extra (experimental)");
+        put("post_n",
+                "Skips more small post-processing passes: fewer render passes and faster on weak GPUs, but some effects may look wrong or dark. Turn it off if so.",
+                "Saute d'autres petites passes de post-traitement : moins de passes de rendu et plus rapide sur les GPU modestes, mais certains effets peuvent paraître faux ou sombres. Désactivez-le dans ce cas.",
+                "Überspringt weitere kleine Nachbearbeitungs-Durchgänge: weniger Render-Durchgänge und schneller auf schwachen GPUs, aber manche Effekte können falsch oder dunkel aussehen. Dann ausschalten.",
+                "Salta altre piccole passate di post-elaborazione: meno passate di rendering e più veloce sulle GPU deboli, ma alcuni effetti possono apparire sbagliati o scuri. In tal caso disattivalo.",
+                "Omite más pasadas pequeñas de posprocesado: menos pasadas de render y más rápido en GPU modestas, pero algunos efectos pueden verse mal u oscuros. Desactívalo si ocurre.",
+                "Pula mais passes pequenos de pós-processamento: menos passes de renderização e mais rápido em GPUs fracas, mas alguns efeitos podem ficar errados ou escuros. Desative se isso acontecer.");
+        put("postplus_t", "Remove low-resolution effects (experimental)", "Supprimer les effets basse résolution (expérimental)",
+                "Effekte in niedriger Auflösung entfernen (experimentell)", "Rimuovi gli effetti a bassa risoluzione (sperimentale)",
+                "Quitar los efectos de baja resolución (experimental)", "Remover os efeitos de baixa resolução (experimental)");
+        put("postplus_n",
+                "Leaves out 16 more small effect passes (low-resolution smoke, glow and similar): about half the draws on a weak GPU, but some effects may disappear. Turn on after Remove extra post-processing.",
+                "Saute 16 passes d'effets supplémentaires (fumée, halo et similaires en basse résolution) : environ la moitié des dessins en moins sur un GPU modeste, mais certains effets peuvent disparaître. À activer après le post-traitement supplémentaire.",
+                "Überspringt 16 weitere kleine Effekt-Durchgänge (Rauch, Leuchten u. Ä. in niedriger Auflösung): etwa die Hälfte der Zeichenaufrufe weniger auf schwachen GPUs, aber manche Effekte können verschwinden. Nach der zusätzlichen Nachbearbeitung einschalten.",
+                "Salta altre 16 passate di effetti (fumo, alone e simili a bassa risoluzione): circa la metà dei disegni in meno su una GPU debole, ma alcuni effetti possono sparire. Attivalo dopo la post-elaborazione extra.",
+                "Omite 16 pasadas de efectos más (humo, brillo y similares en baja resolución): cerca de la mitad de los dibujos menos en una GPU modesta, pero algunos efectos pueden desaparecer. Actívalo después del posprocesado extra.",
+                "Pula mais 16 passes de efeitos (fumaça, brilho e similares em baixa resolução): cerca de metade dos desenhos a menos em uma GPU fraca, mas alguns efeitos podem desaparecer. Ative depois do pós-processamento extra.");
+        put("hidden_t", "Skip hidden objects", "Ignorer les objets cachés", "Verdeckte Objekte überspringen",
+                "Salta gli oggetti nascosti", "Omitir objetos ocultos", "Pular objetos ocultos");
+        put("prepass_t", "Skip depth prepass", "Ignorer le pré-passage de profondeur", "Tiefen-Vorpass überspringen",
+                "Salta il pre-pass di profondità", "Omitir prepaso de profundidad", "Pular pré-passe de profundidade");
+        put("prepass_n",
+                "Leaves out the game's depth-only pass and lets the colour pass write the depth: half the vertex work and one render pass less per frame. Experimental; compare the frame times.",
+                "Ignore le passage de profondeur seule du jeu et laisse le passage couleur écrire la profondeur : moitié moins de travail de sommets et un passage de moins par image. Expérimental ; comparez les temps d'image.",
+                "Lässt den reinen Tiefenpass des Spiels aus; der Farbpass schreibt die Tiefe: halb so viel Vertexarbeit und ein Renderpass weniger pro Bild. Experimentell; Bildzeiten vergleichen.",
+                "Salta il passaggio di sola profondità del gioco e fa scrivere la profondità al passaggio colore: metà lavoro sui vertici e un render pass in meno per fotogramma. Sperimentale; confronta i tempi di frame.",
+                "Omite el pase de solo profundidad del juego y deja que el pase de color escriba la profundidad: la mitad del trabajo de vértices y un render pass menos por fotograma. Experimental; compara los tiempos de fotograma.",
+                "Pula o passe só de profundidade do jogo e deixa o passe de cor gravar a profundidade: metade do trabalho de vértices e um render pass a menos por quadro. Experimental; compare os tempos de quadro.");
+        put("hidden_std", "Normal", "Normal", "Normal", "Normale", "Normal", "Normal");
+        put("hidden_ext", "Extended (effects too)", "Étendu (effets inclus)", "Erweitert (inkl. Effekte)",
+                "Esteso (anche effetti)", "Ampliado (con efectos)", "Ampliado (com efeitos)");
+        put("hidden_max", "Maximum (rare retests)", "Maximum (tests espacés)", "Maximal (seltene Tests)",
+                "Massimo (test rari)", "Máximo (pruebas espaciadas)", "Máximo (testes espaçados)");
+        put("hidden_n",
+                "Does not draw objects that covered no pixel in the last frames (retried every few frames). Faster on weak GPUs; an object coming into view can appear a few frames late.",
+                "Ne dessine pas les objets qui n'ont couvert aucun pixel ces dernières images (réessayés toutes les quelques images). Plus rapide sur les GPU modestes ; un objet qui apparaît peut arriver avec quelques images de retard.",
+                "Zeichnet keine Objekte, die in den letzten Bildern keinen Pixel abdeckten (alle paar Bilder erneut geprüft). Schneller auf schwachen GPUs; ein ins Bild tretendes Objekt kann einige Bilder zu spät erscheinen.",
+                "Non disegna gli oggetti che negli ultimi fotogrammi non hanno coperto alcun pixel (ritentati ogni pochi fotogrammi). Più veloce sulle GPU deboli; un oggetto che entra in vista può comparire con qualche fotogramma di ritardo.",
+                "No dibuja los objetos que no cubrieron ningún píxel en los últimos fotogramas (se reintentan cada pocos fotogramas). Más rápido en GPU modestas; un objeto que entra en vista puede aparecer con unos fotogramas de retraso.",
+                "Não desenha objetos que não cobriram nenhum pixel nos últimos quadros (testados de novo a cada poucos quadros). Mais rápido em GPUs fracas; um objeto que entra em vista pode aparecer com alguns quadros de atraso.");
+        put("aniso_0", "Game's own", "Celui du jeu", "Wie im Spiel", "Quello del gioco", "El del juego", "O do jogo");
+        put("aniso_off", "Off", "Désactivé", "Aus", "Disattivato", "Desactivado", "Desativado");
         put("mip_t", "Texture mip skip", "Saut de mip des textures", "Textur-Mip überspringen", "Salto mip delle texture",
                 "Omitir mip de texturas", "Pular mip de texturas", "Пропуск MIP текстур", "テクスチャ MIP スキップ",
                 "텍스처 밉 건너뛰기", "跳过纹理 Mip", "略過紋理 Mip");
@@ -583,198 +789,6 @@ final class Strings {
                 "儲存");
         put("reset", "Reset", "Réinitialiser", "Zurücksetzen", "Ripristina", "Restablecer", "Redefinir", "Сбросить",
                 "リセット", "초기화", "重置", "重設");
-        put("tab_cheats",
-                "Cheats",
-                "Codes de triche",
-                "Cheats",
-                "Trucchi",
-                "Trucos",
-                "Trapaças",
-                "Читы",
-                "チート",
-                "치트",
-                "作弊码",
-                "作弊碼");
-        put("sec_cheats",
-                "Cheats",
-                "Codes de triche",
-                "Cheats",
-                "Trucchi",
-                "Trucos",
-                "Trapaças",
-                "Читы",
-                "チート",
-                "치트",
-                "作弊码",
-                "作弊碼");
-        put("cheats_n",
-                "Cheat codes in the Atmosphère format (the same .txt files Eden uses) for this game build, %1$s. They are kept in %2$s. Cheats can crash the game or damage your save: turn on only cheats you trust. Changes apply at once. Long-press a cheat to see its codes or delete it.",
-                "Codes de triche au format Atmosphère (les mêmes fichiers .txt qu'Eden) pour cette version du jeu, %1$s. Ils sont enregistrés dans %2$s. Les codes peuvent faire planter le jeu ou abîmer votre sauvegarde : n'activez que ceux en qui vous avez confiance. Les changements s'appliquent immédiatement. Appui long sur un code pour voir son contenu ou le supprimer.",
-                "Cheat-Codes im Atmosphère-Format (dieselben .txt-Dateien wie bei Eden) für diesen Spiel-Build, %1$s. Sie liegen in %2$s. Cheats können das Spiel abstürzen lassen oder den Spielstand beschädigen: Schalte nur Cheats ein, denen du vertraust. Änderungen gelten sofort. Lange auf einen Cheat drücken, um seine Codes zu sehen oder ihn zu löschen.",
-                "Trucchi nel formato Atmosphère (gli stessi file .txt usati da Eden) per questa build del gioco, %1$s. Sono salvati in %2$s. I trucchi possono bloccare il gioco o danneggiare il salvataggio: attiva solo quelli di cui ti fidi. Le modifiche hanno effetto subito. Tieni premuto un trucco per vederne i codici o eliminarlo.",
-                "Trucos en formato Atmosphère (los mismos archivos .txt que usa Eden) para esta versión del juego, %1$s. Se guardan en %2$s. Los trucos pueden cerrar el juego o dañar tu partida guardada: activa solo los que sean de confianza. Los cambios se aplican al instante. Mantén pulsado un truco para ver sus códigos o eliminarlo.",
-                "Trapaças no formato Atmosphère (os mesmos arquivos .txt que o Eden usa) para esta versão do jogo, %1$s. Ficam em %2$s. Trapaças podem travar o jogo ou danificar seu save: ative só as que você confia. As mudanças valem na hora. Toque e segure uma trapaça para ver os códigos ou excluí-la.",
-                "Чит-коды в формате Atmosphère (те же файлы .txt, что использует Eden) для этой сборки игры, %1$s. Они хранятся в %2$s. Читы могут привести к вылету игры или повредить сохранение: включайте только те, которым доверяете. Изменения применяются сразу. Долгое нажатие на чит — показать коды или удалить его.",
-                "このゲームのビルド %1$s 用の Atmosphère 形式のチートコード（Eden と同じ .txt ファイル）です。保存先: %2$s。チートはゲームのクラッシュやセーブデータの破損を招くことがあります。信頼できるものだけをオンにしてください。変更はすぐに反映されます。チートを長押しするとコードの表示や削除ができます。",
-                "이 게임 빌드(%1$s)용 Atmosphère 형식 치트 코드입니다(Eden과 같은 .txt 파일). 저장 위치: %2$s. 치트는 게임을 멈추게 하거나 세이브를 손상시킬 수 있으니 믿을 수 있는 것만 켜세요. 변경 사항은 바로 적용됩니다. 치트를 길게 누르면 코드를 보거나 삭제할 수 있습니다.",
-                "适用于此游戏版本（%1$s）的 Atmosphère 格式作弊码（与 Eden 使用的 .txt 文件相同）。保存在 %2$s。作弊码可能导致游戏崩溃或损坏存档：只开启你信任的作弊码。更改立即生效。长按作弊码可查看代码或删除。",
-                "適用於此遊戲版本（%1$s）的 Atmosphère 格式作弊碼（與 Eden 使用的 .txt 檔案相同）。儲存在 %2$s。作弊碼可能導致遊戲當機或損壞存檔：只開啟你信任的作弊碼。變更立即生效。長按作弊碼可檢視代碼或刪除。");
-        put("cheats_none",
-                "No cheats for this build yet: import a .txt file or type one below.",
-                "Aucun code pour cette version : importez un fichier .txt ou saisissez-en un ci-dessous.",
-                "Noch keine Cheats für diesen Build: Importiere eine .txt-Datei oder gib unten einen ein.",
-                "Nessun trucco per questa build: importa un file .txt o scrivine uno qui sotto.",
-                "Aún no hay trucos para esta versión: importa un archivo .txt o escribe uno abajo.",
-                "Ainda não há trapaças para esta versão: importe um arquivo .txt ou digite uma abaixo.",
-                "Для этой сборки пока нет читов: импортируйте файл .txt или введите код ниже.",
-                "このビルド用のチートはまだありません。.txt ファイルを読み込むか、下で入力してください。",
-                "이 빌드용 치트가 아직 없습니다. .txt 파일을 가져오거나 아래에서 입력하세요.",
-                "此版本还没有作弊码：导入 .txt 文件或在下方输入。",
-                "此版本還沒有作弊碼：匯入 .txt 檔案或在下方輸入。");
-        put("cheats_nogame",
-                "Cheats can be set up once the game has started.",
-                "Les codes se configurent une fois le jeu lancé.",
-                "Cheats lassen sich einrichten, sobald das Spiel läuft.",
-                "I trucchi si impostano dopo l'avvio del gioco.",
-                "Los trucos se configuran una vez iniciado el juego.",
-                "As trapaças podem ser configuradas depois que o jogo iniciar.",
-                "Читы можно настроить после запуска игры.",
-                "チートはゲーム起動後に設定できます。",
-                "치트는 게임이 시작된 뒤에 설정할 수 있습니다.",
-                "游戏启动后才能设置作弊码。",
-                "遊戲啟動後才能設定作弊碼。");
-        put("cheat_master",
-                "Master code: always on",
-                "Code maître : toujours actif",
-                "Master-Code: immer aktiv",
-                "Codice master: sempre attivo",
-                "Código maestro: siempre activo",
-                "Código mestre: sempre ativo",
-                "Мастер-код: всегда включён",
-                "マスターコード: 常にオン",
-                "마스터 코드: 항상 켜짐",
-                "主代码：始终开启",
-                "主代碼：始終開啟");
-        put("cheat_bad",
-                "Can't be used: %s",
-                "Inutilisable : %s",
-                "Nicht nutzbar: %s",
-                "Non utilizzabile: %s",
-                "No se puede usar: %s",
-                "Não pode ser usada: %s",
-                "Нельзя использовать: %s",
-                "使用できません: %s",
-                "사용할 수 없음: %s",
-                "无法使用：%s",
-                "無法使用：%s");
-        put("sec_cheats_add",
-                "Add cheats",
-                "Ajouter des codes",
-                "Cheats hinzufügen",
-                "Aggiungi trucchi",
-                "Añadir trucos",
-                "Adicionar trapaças",
-                "Добавить читы",
-                "チートを追加",
-                "치트 추가",
-                "添加作弊码",
-                "新增作弊碼");
-        put("cheat_import",
-                "Import a cheat file (.txt)",
-                "Importer un fichier de codes (.txt)",
-                "Cheat-Datei importieren (.txt)",
-                "Importa un file di trucchi (.txt)",
-                "Importar archivo de trucos (.txt)",
-                "Importar arquivo de trapaças (.txt)",
-                "Импортировать файл читов (.txt)",
-                "チートファイルを読み込む (.txt)",
-                "치트 파일 가져오기 (.txt)",
-                "导入作弊码文件 (.txt)",
-                "匯入作弊碼檔案 (.txt)");
-        put("cheat_type",
-                "Type a cheat",
-                "Saisir un code",
-                "Cheat eingeben",
-                "Scrivi un trucco",
-                "Escribir un truco",
-                "Digitar uma trapaça",
-                "Ввести чит",
-                "チートを入力",
-                "치트 입력",
-                "输入作弊码",
-                "輸入作弊碼");
-        put("cheat_name",
-                "Cheat name",
-                "Nom du code",
-                "Name des Cheats",
-                "Nome del trucco",
-                "Nombre del truco",
-                "Nome da trapaça",
-                "Название чита",
-                "チート名",
-                "치트 이름",
-                "作弊码名称",
-                "作弊碼名稱");
-        put("cheat_codes",
-                "Codes, e.g. 04000000 0123ABCD 00000063",
-                "Codes, p. ex. 04000000 0123ABCD 00000063",
-                "Codes, z. B. 04000000 0123ABCD 00000063",
-                "Codici, es. 04000000 0123ABCD 00000063",
-                "Códigos, p. ej. 04000000 0123ABCD 00000063",
-                "Códigos, ex.: 04000000 0123ABCD 00000063",
-                "Коды, напр. 04000000 0123ABCD 00000063",
-                "コード 例: 04000000 0123ABCD 00000063",
-                "코드 예: 04000000 0123ABCD 00000063",
-                "代码，例如 04000000 0123ABCD 00000063",
-                "代碼，例如 04000000 0123ABCD 00000063");
-        put("cheats_added",
-                "Added %d cheat(s).",
-                "%d code(s) ajouté(s).",
-                "%d Cheat(s) hinzugefügt.",
-                "%d trucco/i aggiunto/i.",
-                "%d truco(s) añadido(s).",
-                "%d trapaça(s) adicionada(s).",
-                "Добавлено читов: %d.",
-                "%d 件のチートを追加しました。",
-                "치트 %d개를 추가했습니다.",
-                "已添加 %d 个作弊码。",
-                "已新增 %d 個作弊碼。");
-        put("cheats_added_bad",
-                "Added %1$d cheat(s); %2$d of them can't be used (the list says why).",
-                "%1$d code(s) ajouté(s) ; %2$d inutilisable(s) (la liste indique pourquoi).",
-                "%1$d Cheat(s) hinzugefügt; %2$d davon nicht nutzbar (die Liste nennt den Grund).",
-                "%1$d trucco/i aggiunto/i; %2$d non utilizzabile/i (l'elenco spiega perché).",
-                "%1$d truco(s) añadido(s); %2$d no se pueden usar (la lista indica el motivo).",
-                "%1$d trapaça(s) adicionada(s); %2$d não podem ser usadas (a lista diz o motivo).",
-                "Добавлено читов: %1$d; из них нельзя использовать: %2$d (причина указана в списке).",
-                "%1$d 件のチートを追加しました。うち %2$d 件は使用できません（理由は一覧に表示されます）。",
-                "치트 %1$d개를 추가했습니다. 그중 %2$d개는 사용할 수 없습니다(이유는 목록에 표시됨).",
-                "已添加 %1$d 个作弊码，其中 %2$d 个无法使用（原因见列表）。",
-                "已新增 %1$d 個作弊碼，其中 %2$d 個無法使用（原因見清單）。");
-        put("cheat_del_failed",
-                "The cheat could not be deleted (its file could not be written).",
-                "Le code n'a pas pu être supprimé (son fichier n'a pas pu être écrit).",
-                "Der Cheat konnte nicht gelöscht werden (seine Datei ließ sich nicht schreiben).",
-                "Impossibile eliminare il trucco (non è stato possibile scrivere il suo file).",
-                "No se pudo eliminar el truco (no se pudo escribir su archivo).",
-                "Não foi possível excluir a trapaça (o arquivo dela não pôde ser gravado).",
-                "Не удалось удалить чит (не удалось записать его файл).",
-                "チートを削除できませんでした（ファイルに書き込めません）。",
-                "치트를 삭제하지 못했습니다(파일을 쓸 수 없음).",
-                "无法删除作弊码（无法写入其文件）。",
-                "無法刪除作弊碼（無法寫入其檔案）。");
-        put("cheat_no_picker",
-                "No app is available to choose a file. Copy the .txt file into %s instead (named after the build id), then open this tab again.",
-                "Aucune application ne permet de choisir un fichier. Copiez plutôt le fichier .txt dans %s (nommé d'après l'identifiant de version), puis rouvrez cet onglet.",
-                "Keine App zum Auswählen einer Datei verfügbar. Kopiere die .txt-Datei stattdessen nach %s (benannt nach der Build-ID) und öffne diesen Tab erneut.",
-                "Nessuna app disponibile per scegliere un file. Copia il file .txt in %s (con il nome dell'ID della build), poi riapri questa scheda.",
-                "No hay ninguna app para elegir un archivo. Copia el archivo .txt en %s (con el nombre del ID de la versión) y vuelve a abrir esta pestaña.",
-                "Nenhum app disponível para escolher um arquivo. Copie o arquivo .txt para %s (com o nome do ID da versão) e abra esta aba de novo.",
-                "Нет приложения для выбора файла. Скопируйте файл .txt в %s (с именем по ID сборки) и снова откройте эту вкладку.",
-                "ファイルを選べるアプリがありません。代わりに .txt ファイルを %s にコピーし（ファイル名はビルド ID）、このタブを開き直してください。",
-                "파일을 고를 앱이 없습니다. 대신 .txt 파일을 %s에 복사한 뒤(이름은 빌드 ID) 이 탭을 다시 여세요.",
-                "没有可选择文件的应用。请将 .txt 文件复制到 %s（以版本 ID 命名），然后重新打开此标签页。",
-                "沒有可選擇檔案的應用程式。請將 .txt 檔案複製到 %s（以版本 ID 命名），然後重新開啟此分頁。");
         put("cancel", "Cancel", "Annuler", "Abbrechen", "Annulla", "Cancelar", "Cancelar", "Отмена", "キャンセル", "취소",
                 "取消", "取消");
 

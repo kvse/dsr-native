@@ -1,8 +1,8 @@
 // Hooks on specific functions inside the game's main module, for the game builds listed in kBuilds (matched by
-// build id): 1.0.0 and the 1.0.3 update (two editions of it: title 010088F00820E000's and 01004AB00A260000's, the same
-// version with different programs). They replace engine functions whose output is useful to us but goes
+// build id): 1.0.0 and the 1.0.3 update. They replace engine functions whose output is useful to us but goes
 // nowhere in a retail build, and patch the frame rate and resolution. The places were found in 1.0.0 and matched
 // in 1.0.3 by their code (the same instructions around them, with addresses masked).
+#include <sys/resource.h>
 #include <algorithm>
 #include <cmath>
 #include <cstdarg>
@@ -71,14 +71,6 @@ const GameBuild kBuilds[] = {
      0x69c638, 0x69c824, 0x711ff0, 0x69c684, 0x69c894, 0x711ff8,
      0x7f71d4, 0x7f72ec, 0x782dac, 60,
      0x356790, 0x1adf890},
-    // 1.0.3 of title 01004AB00A260000 (update v196608, buildinfo region DV): the same game and data as the other
-    // 1.0.3 with its code moved; matched from it, and the limiter's fields are the same.
-    {"df3766a2bb651a3e822828abf10b6f7b", "1.0.3", "20181026_101",
-     0x667900, 0xF0008088, 0xBD46ED08,
-     0x707090, 0, 0x2f7, 0x2e8, 0x2f5, 0x2f6, 0x2f8,
-     0x69c608, 0x69c7f4, 0x711ec8, 0x69c654, 0x69c864, 0x711ed0,
-     0x7f9ec8, 0x7f9fe0, 0x784660, 60,
-     0x356790, 0x1ae3890},
 };
 const GameBuild* g_build = nullptr;
 
@@ -89,45 +81,61 @@ const GameBuild* g_build = nullptr;
 // down a timer (this+0xe0) before closing the dialog: that step branches straight to its close path. Everything
 // else (loading, the title movie, press start) runs as before.
 struct LogoSkip {
-    const char* build_id;  // first hex digits of the build (GameBuild::build_id)
+    const char* version;
     uint64_t open[2];
     uint32_t open_insn[2];  // bl set_dialog_request (60, 1)
     uint64_t timer;         // ldr s1, [x19, #0xe0]
     uint64_t timer_done;    // the timer-expired path
 };
 const LogoSkip kLogoSkips[] = {
-    {"5a797a3a", {0x6f1c30, 0x6f73e8}, {0x97fa3d6c, 0x97fa277e}, 0x6f7450, 0x6f746c},
-    {"6569410c", {0x6ed0e4, 0x6f27fc}, {0x97fa3510, 0x97fa1f4a}, 0x6f2864, 0x6f2880},
-    {"df3766a2", {0x6ecf7c, 0x6f268c}, {0x97fa355e, 0x97fa1f9a}, 0x6f26f4, 0x6f2710},
+    {"1.0.0", {0x6f1c30, 0x6f73e8}, {0x97fa3d6c, 0x97fa277e}, 0x6f7450, 0x6f746c},
+    {"1.0.3", {0x6ed0e4, 0x6f27fc}, {0x97fa3510, 0x97fa1f4a}, 0x6f2864, 0x6f2880},
 };
 constexpr uint32_t kNop = 0xD503201F, kLdrS1Timer = 0xBD40E261;
 
-// Performance mode: low-quality effects, 1024x1024 shadow maps (see GameBuild); the menu also sets render scale 0.75.
+// Quality patches: low-quality effects (performance_mode or low_effects) and the shadow map size (shadow_quality;
+// performance_mode alone gives 1024). The menu also sets render scale 0.75 with performance mode.
 // Each part is checked before it is changed and is skipped (logged) if the game's code or data is not as expected.
-void ApplyPerformanceMode(Runtime& rt, const GameBuild& b) {
+void ApplyQualityPatches(Runtime& rt, const GameBuild& b) {
     constexpr uint32_t kLdrbLowVfx = 0x3956668A;    // ldrb w10, [x20, #0x599]
     constexpr uint32_t kMovLowVfxOn = 0x5280002A;   // mov w10, #1
     std::string err;
     std::string done;
-    if (rt.main.PatchInstruction(b.lowvfx_read, kLdrbLowVfx, kMovLowVfxOn, &err))
-        done += done.empty() ? "low-quality effects" : ", low-quality effects";
-    else
-        LOGW("hooks", "performance mode: effects quality not changed (%s)", err.c_str());
-    int32_t* shadow = reinterpret_cast<int32_t*>(rt.main.base() + b.shadow_size);
-    if (rt.main.Contains(reinterpret_cast<uintptr_t>(shadow)) && *shadow == 2048) {
-        *shadow = 1024;
-        done += done.empty() ? "shadow maps 1024" : ", shadow maps 1024";
-    } else {
-        LOGW("hooks", "performance mode: shadow map size not changed (found %d)",
-             rt.main.Contains(reinterpret_cast<uintptr_t>(shadow)) ? *shadow : -1);
+    auto add = [&](const char* what) {
+        if (!done.empty()) done += ", ";
+        done += what;
+    };
+    if (rt.config.performance_mode || rt.config.low_effects) {
+        if (rt.main.PatchInstruction(b.lowvfx_read, kLdrbLowVfx, kMovLowVfxOn, &err))
+            add("low-quality effects");
+        else
+            LOGW("hooks", "quality: effects quality not changed (%s)", err.c_str());
     }
-    LOGI("hooks", "performance mode: %s", done.empty() ? "nothing applied" : done.c_str());
+    int size = 2048;
+    switch (rt.config.shadow_quality) {
+        case 0: size = 512; break;   // off: the pass is skipped by the renderer; a 512 map is all that is left
+        case 1: size = 512; break;
+        case 2: size = 1024; break;
+        default: size = rt.config.performance_mode ? 1024 : 2048; break;
+    }
+    if (size != 2048) {
+        int32_t* shadow = reinterpret_cast<int32_t*>(rt.main.base() + b.shadow_size);
+        if (rt.main.Contains(reinterpret_cast<uintptr_t>(shadow)) && *shadow == 2048) {
+            *shadow = size;
+            add(size == 512 ? "shadow maps 512" : "shadow maps 1024");
+        } else {
+            LOGW("hooks", "quality: shadow map size not changed (found %d)",
+                 rt.main.Contains(reinterpret_cast<uintptr_t>(shadow)) ? *shadow : -1);
+        }
+    }
+    if (rt.config.shadow_quality == 0) add("shadows off");
+    LOGI("hooks", "quality: %s", done.empty() ? "nothing changed" : done.c_str());
 }
 
 void SkipIntroLogos(Runtime& rt, const GameBuild& b) {
     const LogoSkip* p = nullptr;
     for (const LogoSkip& l : kLogoSkips)
-        if (!strncmp(l.build_id, b.build_id, strlen(l.build_id))) p = &l;
+        if (!strcmp(l.version, b.version)) p = &l;
     if (!p) return;
     struct Edit { uint64_t at; uint32_t from, to; };
     const Edit edits[] = {
@@ -305,11 +313,15 @@ void EnginePanic(const char* file, int line, const char* fmt, ...) {
 // scene keeps a 16:9 aspect ratio. Cameras keep {fov, aspect, near, far} at +0x50..+0x5c (main+0xfa7f4 reads
 // fov and aspect for the view frustum). This scans the guest heap and the game's data for such blocks with a
 // 16:9 aspect, logs them (with the owner's vtable, to find the code that sets it) and writes the wanted aspect
-// into them, again every second (rescanning every 2 s until cameras are found, then every 10 s).
+// into them, again every second (rescanning every 2 s until cameras are found, then every 10 s). While nothing is
+// found the pause between scans doubles (2, 4, 8 ... up to 30 s): a scan walks the whole guest heap (1-1.6 s on a
+// phone), and repeating it every 2-3 s kept ~30 % of a core busy for the whole session (log of 2026-11-19).
 float g_aspect = 0;
 void CameraAspectThread() {
     pthread_setname_np(pthread_self(), "dsr-aspect");
+    setpriority(PRIO_PROCESS, 0, 10);  // a background scan must not compete with the game and render threads
     const loader::Module& m = GetRuntime().main;
+    int empty_pause = 2;  // seconds between scans while no camera has been found (doubles up to 30)
     std::vector<float*> found;
     int scans = 0;
     auto plausible = [](const float* a) {  // a = &aspect: fov before it, near and far after
@@ -352,7 +364,13 @@ void CameraAspectThread() {
         if (new_found || scans <= 3 || scans % 60 == 0)
             LOGI("hooks", "camera aspect: scan %d (%.0f ms): %d new 16:9 cameras, %zu in all; setting them to %.3f", scans,
                  scan_ms, new_found, found.size(), g_aspect);
-        const int rewrites = found.empty() ? 2 : 10;  // 2 s, then 10 s between scans
+        int rewrites = 10;  // 10 s between scans once cameras are known
+        if (found.empty()) {
+            rewrites = empty_pause;
+            empty_pause = std::min(empty_pause * 2, 30);
+        } else {
+            empty_pause = 2;
+        }
         for (int k = 0; k < rewrites; k++) {
             for (float* a : found)
                 if (*a > 1.7777f && *a < 1.7779f && plausible(a)) *a = g_aspect;
@@ -419,7 +437,7 @@ void InstallGameHooks() {
             Trim(data);
             for (char* e = data + strlen(data); e > data && e[-1] == ' '; *--e = 0) {}
             for (const GameBuild& o : kBuilds)
-                if (strcmp(o.data_version, b.data_version) != 0 && strcmp(data, o.data_version) == 0)
+                if (&o != &b && strcmp(data, o.data_version) == 0)
                     LOGW("hooks", "the game's data files are version %s (DataVersion %s) but the program is %s: "
                          "install the matching data (the update's RomFS) or the game may misbehave", o.version, data,
                          b.version);
@@ -475,7 +493,7 @@ void InstallGameHooks() {
     // game's half- and quarter-size buffers (640x360, 320x180) keep their 720-line sizes whatever the render
     // resolution, and a 4:3 test at 1280x960 died silently on loading a save. Only the width changes: wider
     // than 16:9 shows more at the sides, narrower (4:3: 960x720) less.
-    // Render scale (settings render_scale, 0.5 - 1.0): the same resolution settings at a lower size, height and
+    // Render scale (settings render_scale, 0.30 - 1.0): the same resolution settings at a lower size, height and
     // width together (the height also has a getter with its own default, main+0x6a193c: main+0x6a1968 mov w2, #720).
     // The game draws less and the frame is enlarged to the screen at the end. Heights stay at or below 720 (the
     // fixed half- and quarter-size buffers are then larger than needed, which is harmless).
@@ -495,9 +513,9 @@ void InstallGameHooks() {
             ar = 16.0f / 9.0f;
             ar_ok = false;
         }
-        const float scale = std::clamp(rt.config.render_scale, 0.5f, 1.0f);
-        const int height = std::clamp(int(std::lround(720.0f * scale / 8.0f)) * 8, 360, 720);
-        const int width = std::clamp(int(std::lround(float(height) * ar / 8.0f)) * 8, 320, 1920);
+        const float scale = std::clamp(rt.config.render_scale, 0.30f, 1.0f);
+        const int height = std::clamp(int(std::lround(720.0f * scale / 8.0f)) * 8, 216, 720);
+        const int width = std::clamp(int(std::lround(float(height) * ar / 8.0f)) * 8, 216, 1920);
         if (width != 1280 || height != 720) {
             std::string err;
             auto mov = [](int rd, int v) { return 0x52800000u | (uint32_t(v) << 5) | uint32_t(rd); };
@@ -523,7 +541,7 @@ void InstallGameHooks() {
         }
     }
     if (rt.config.skip_intro) SkipIntroLogos(rt, b);
-    if (rt.config.performance_mode) ApplyPerformanceMode(rt, b);
+    if (rt.config.performance_mode || rt.config.low_effects || rt.config.shadow_quality != 3) ApplyQualityPatches(rt, b);
     const Hook hooks[] = {
         {b.log, reinterpret_cast<void*>(&EngineLog), "engine log"},
         {b.vlog, reinterpret_cast<void*>(&EngineLogV), "engine vlog"},

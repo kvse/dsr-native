@@ -10,6 +10,13 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <cstdio>
+#include <cstdlib>
+#include <ctime>
+#include <dirent.h>
+#include <string>
+#include <unistd.h>
+#include <vector>
 #include <map>
 #include <mutex>
 #include <unordered_map>
@@ -240,7 +247,9 @@ bool ProgramSetShaders(void* program, int count, const ShaderData* stages) {
             memcpy(hdr, stages[i].control, sizeof(hdr));
             if (hdr[0] == 0x98761234u && hdr[8] > n && hdr[8] <= 0x10000 && GuestRangeValid(a, hdr[8])) section = hdr[8];
         }
-        DumpShader(a, reinterpret_cast<const void*>(a), section, stages[i].control, control_size);
+        // The shader dump (hash + disk write per shader) is a diagnostics tool: only with auto_capture on.
+        if (dsr::GetRuntime().config.auto_capture)
+            DumpShader(a, reinterpret_cast<const void*>(a), section, stages[i].control, control_size);
         if (a && n >= 0x88) {
             auto sc = std::make_shared<ShaderCode>();
             const uint8_t* p = reinterpret_cast<const uint8_t*>(a);
@@ -473,6 +482,56 @@ uint64_t WindowTexturePresentSeq(const void* window, int index) {
     return it == g_present_seqs.end() ? 0 : it->second;
 }
 
+// Every 10 s: the CPU load of each thread of the process (100% = one core), from /proc, to see which thread limits the
+// frame (the game's own logic thread, the render thread, the recorder, the decoders...).
+static void LogThreadLoad(double wall_s) {
+    static std::map<int, unsigned long long> prev;
+    struct Row {
+        std::string name;
+        double pct;
+        int tid;
+    };
+    std::vector<Row> rows;
+    DIR* d = opendir("/proc/self/task");
+    if (!d) return;
+    const double hz = double(sysconf(_SC_CLK_TCK));
+    while (dirent* e = readdir(d)) {
+        const int tid = atoi(e->d_name);
+        if (tid <= 0) continue;
+        char path[64];
+        snprintf(path, sizeof path, "/proc/self/task/%d/stat", tid);
+        FILE* f = fopen(path, "r");
+        if (!f) continue;
+        char buf[1024];
+        const size_t n = fread(buf, 1, sizeof buf - 1, f);
+        fclose(f);
+        buf[n] = 0;
+        const char* open = strchr(buf, '(');
+        const char* close = strrchr(buf, ')');
+        if (!open || !close || close < open) continue;
+        const std::string name(open + 1, size_t(close - open - 1));
+        unsigned long long ut = 0, st = 0;
+        if (sscanf(close + 2, "%*c %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u %llu %llu", &ut, &st) != 2) continue;
+        const unsigned long long total = ut + st;
+        auto it = prev.find(tid);
+        const unsigned long long before = it == prev.end() ? total : it->second;
+        prev[tid] = total;
+        const double pct = 100.0 * double(total - before) / hz / std::max(wall_s, 0.001);
+        if (pct >= 3.0) rows.push_back({name, pct, tid});
+    }
+    closedir(d);
+    std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) { return a.pct > b.pct; });
+    std::string out;
+    double sum = 0;
+    for (const Row& r : rows) sum += r.pct;
+    for (size_t i = 0; i < rows.size() && i < 10; i++) {
+        char one[96];
+        snprintf(one, sizeof one, "%s%s(%d) %.0f%%", i ? ", " : "", rows[i].name.c_str(), rows[i].tid, rows[i].pct);
+        out += one;
+    }
+    LOGI(kTag, "thread load (last %.0f s, 100%% = one core, total %.0f%%): %s", wall_s, sum, out.c_str());
+}
+
 void QueuePresentTexture(void* queue, void* window, int index) {
     using clock = std::chrono::steady_clock;
     static thread_local clock::time_point next = clock::now();
@@ -493,6 +552,20 @@ void QueuePresentTexture(void* queue, void* window, int index) {
     static double ft_sum = 0, ft_max = 0;
     static uint64_t ft_n = 0, ft_hitches = 0;
     static double step_sum = 0;
+    // The game's presenting thread: time between two presents (its own work) and how much of it was CPU, then the time
+    // spent in here sleeping for the frame cap and waiting for the GPU.
+    static double between_sum = 0, cpu_sum = 0, sleep_sum = 0, gpuwait_sum = 0;
+    static clock::time_point left_last = now;
+    static double cpu_left = 0;
+    const auto thread_cpu_ms = [] {
+        timespec ts;
+        clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+        return double(ts.tv_sec) * 1e3 + double(ts.tv_nsec) / 1e6;
+    };
+    if (!was_paused) {
+        between_sum += std::chrono::duration<double, std::milli>(now - left_last).count();
+        if (cpu_left > 0) cpu_sum += thread_cpu_ms() - cpu_left;
+    }
     {
         const double ms = std::chrono::duration<double, std::milli>(now - last_present).count();
         last_present = now;
@@ -510,16 +583,20 @@ void QueuePresentTexture(void* queue, void* window, int index) {
         LOGI(kTag, "presenting at up to %d fps (settings); nvnQueuePresentTexture called from main+0x%lx", fps,
              (unsigned long)(m.Contains(ra) ? ra - m.base() : 0));
     }
-    if (next > now)
+    if (next > now) {
+        const auto t0 = clock::now();
         std::this_thread::sleep_until(next);
-    else if (now - next > frame * 4)
+        sleep_sum += std::chrono::duration<double, std::milli>(clock::now() - t0).count();
+    } else if (now - next > frame * 4)
         next = now;  // fell behind (loading): resync instead of bursting
     next += frame;
 
     TexRef tex = WindowTexture(window, index);
     // Present on the render thread, after the frame's commands. At most two frames queued ahead.
     static uint64_t presents[2] = {0, 0};
+    const auto gw0 = clock::now();
     GpuWait(presents[0]);
+    gpuwait_sum += std::chrono::duration<double, std::milli>(clock::now() - gw0).count();
     presents[0] = presents[1];
     presents[1] = GpuEnqueue([tex] { GetBackend().Present(tex); });
     NoteWindowTexturePresent(window, index, presents[1]);
@@ -538,6 +615,15 @@ void QueuePresentTexture(void* queue, void* window, int index) {
                  "game waited for the render thread %.0f ms at presents, %.0f ms in sync waits (last 10 s); cap %d fps%s",
                  ft_sum / ft_n, ft_max, (unsigned long long)ft_hitches, 2.0 * 1000.0 / fps, 1000.0 * step_sum / ft_n,
                  wait_present, wait_sync, dsr::FrameRateNow(), dsr::GetRuntime().config.dynamic_fps ? " (auto)" : "");
+        if (ft_n) {
+            LOGI(kTag, "game render thread per frame: %.1f ms of its own work between presents (%.1f ms of it on the CPU), "
+                 "%.1f ms sleeping for the frame cap, %.1f ms waiting for the GPU at present",
+                 between_sum / ft_n, cpu_sum / ft_n, sleep_sum / ft_n, gpuwait_sum / ft_n);
+        }
+        static clock::time_point load_t = clock::now() - std::chrono::seconds(10);
+        LogThreadLoad(std::chrono::duration<double>(clock::now() - load_t).count());
+        load_t = clock::now();
+        between_sum = cpu_sum = sleep_sum = gpuwait_sum = 0;
         ft_sum = ft_max = step_sum = 0;
         ft_n = ft_hitches = 0;
         GpuStats s = Stats();
@@ -552,6 +638,8 @@ void QueuePresentTexture(void* queue, void* window, int index) {
         last = s;
         frames_at_report = n;
     }
+    left_last = clock::now();
+    cpu_left = thread_cpu_ms();
 }
 
 // ---- command buffers -----------------------------------------------------------------------------------------

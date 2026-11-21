@@ -31,16 +31,42 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64" OR ANDROID_ABI STREQUAL "arm64
     set(DSR_ARM64 ON)
 endif()
 
+
+# FSR 1 upscaler shaders (settings upscaler = 1 or 2): GLSL compiled to SPIR-V at build time with glslc, which the
+# Android NDK ships (shader-tools/) and the Vulkan SDK too. Without it the build still works: the upscaler is left
+# out (DSR_HAVE_FSR1 not defined) and the picture is enlarged by the plain blit as before.
+set(DSR_GLSLC_HINTS)
+if(ANDROID AND ANDROID_NDK AND ANDROID_NDK_HOST_SYSTEM_NAME)
+  list(APPEND DSR_GLSLC_HINTS "${ANDROID_NDK}/shader-tools/${ANDROID_NDK_HOST_SYSTEM_NAME}")
+endif()
+find_program(DSR_GLSLC glslc HINTS ${DSR_GLSLC_HINTS} ENV VULKAN_SDK PATH_SUFFIXES Bin bin)
 add_library(dsrcore OBJECT ${DSR_CORE_SOURCES})
 target_include_directories(dsrcore PUBLIC src third_party/spirv)
+if(DSR_GLSLC)
+  set(DSR_GEN_DIR "${CMAKE_BINARY_DIR}/generated")
+  set(DSR_SHADERS_DIR "${CMAKE_SOURCE_DIR}/src/hle/nvn/shaders")
+  add_custom_command(OUTPUT "${DSR_GEN_DIR}/fsr1_spv.h"
+      COMMAND ${CMAKE_COMMAND} -DGLSLC=${DSR_GLSLC} -DSRC_DIR=${DSR_SHADERS_DIR} -DOUT=${DSR_GEN_DIR}/fsr1_spv.h
+              -DWORK=${DSR_GEN_DIR} -P "${CMAKE_SOURCE_DIR}/cmake/build_fsr1_spv.cmake"
+      DEPENDS "${DSR_SHADERS_DIR}/fsr1.vert" "${DSR_SHADERS_DIR}/fsr1_easu.frag" "${DSR_SHADERS_DIR}/fsr1_rcas.frag"
+              "${CMAKE_SOURCE_DIR}/cmake/build_fsr1_spv.cmake"
+      VERBATIM)
+  add_custom_target(dsr_fsr1_shaders DEPENDS "${DSR_GEN_DIR}/fsr1_spv.h")
+  add_dependencies(dsrcore dsr_fsr1_shaders)
+  target_include_directories(dsrcore PRIVATE "${DSR_GEN_DIR}")
+  target_compile_definitions(dsrcore PRIVATE DSR_HAVE_FSR1=1)
+  message(STATUS "dsr: FSR 1 shaders with ${DSR_GLSLC}")
+else()
+  message(WARNING "dsr: glslc not found: the FSR 1 upscaler is left out of this build")
+endif()
 target_compile_options(dsrcore PRIVATE
     -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers -Wno-cast-function-type
     $<$<COMPILE_LANGUAGE:CXX>:-fno-exceptions>)
 if(ANDROID)
     # The Android Gradle plugin builds its debug variant with CMAKE_BUILD_TYPE=Debug (-O0). The emulator must
     # be optimised whatever the variant: these come after the build type's flags, so they win.
-    message(STATUS "dsr: CMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}; native code forced to -O2")
-    target_compile_options(dsrcore PRIVATE -O2 -fno-omit-frame-pointer)
+    message(STATUS "dsr: CMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}; native code forced to -O3")
+    target_compile_options(dsrcore PRIVATE -O3 -fno-omit-frame-pointer)
 endif()
 if(ANDROID)
     # abi.S reads the thread_local dsr_host_x18 through TLSDESC relocations, which needs real ELF TLS

@@ -67,18 +67,7 @@ public final class SettingsMenu {
     /** 1: the GPU samples BC textures itself, 0: it does not (converted on the CPU), -1: not known yet. */
     static native int nativeGpuHasBc();
 
-    // Cheats (native runtime/cheats.h); text as UTF-8 bytes.
-    /** "build\tID\tfile" then per cheat "on\tmaster\tname\terror"; empty before the game has started. */
-    static native byte[] nativeCheats();
-    static native boolean nativeCheatSet(int index, boolean on);
-    /** "+added\tunusable", or why nothing was added. */
-    static native byte[] nativeCheatAdd(byte[] text);
-    /** The first problem with the cheats in `text`, or empty. */
-    static native byte[] nativeCheatCheck(byte[] text);
-    static native boolean nativeCheatDelete(int index);
-    static native byte[] nativeCheatText(int index);
-
-    static final int REQ_DRIVER = 4101, REQ_FOLDER = 4102, REQ_CHEATS = 4103;
+    static final int REQ_DRIVER = 4101, REQ_FOLDER = 4102;
 
     private static String sSettingsPath = "", sDriversDir = "", sRunningDriver = "system", sGameDir = "",
             sDefaultGameDir = "";
@@ -140,13 +129,11 @@ public final class SettingsMenu {
 
     /** From GameActivity.onActivityResult: true if the result was for the menu. */
     static boolean onActivityResult(Activity activity, int requestCode, int resultCode, Intent data) {
-        if (requestCode != REQ_DRIVER && requestCode != REQ_FOLDER && requestCode != REQ_CHEATS) return false;
+        if (requestCode != REQ_DRIVER && requestCode != REQ_FOLDER) return false;
         Uri uri = resultCode == Activity.RESULT_OK && data != null ? data.getData() : null;
         if (sOpen == null || uri == null) return true;
         if (requestCode == REQ_DRIVER)
             sOpen.importDriver(uri);
-        else if (requestCode == REQ_CHEATS)
-            sOpen.importCheats(uri);
         else
             sOpen.chooseGameFolder(uri);
         return true;
@@ -282,9 +269,8 @@ public final class SettingsMenu {
     private Dialog mDialog;
     private LinearLayout mBody;
     private ScrollView mScroll;
-    private static final String[] TAB_KEYS = {"tab_driver", "tab_settings", "tab_graphics", "tab_touch", "tab_cheats",
-            "tab_language"};
-    private static final int TAB_GRAPHICS = 2, TAB_TOUCH = 3, TAB_CHEATS = 4, TAB_LANGUAGE = 5;
+    private static final String[] TAB_KEYS = {"tab_driver", "tab_settings", "tab_graphics", "tab_touch", "tab_language"};
+    private static final int TAB_GRAPHICS = 2, TAB_TOUCH = 3, TAB_LANGUAGE = 4;
     private final TextView[] mTabs = new TextView[TAB_KEYS.length];
     private TextView mHint, mClose, mScaleLabel;
     private int mTab = 0;
@@ -419,7 +405,6 @@ public final class SettingsMenu {
             case 1: buildSettingsTab(); break;
             case TAB_GRAPHICS: buildGraphicsTab(); break;
             case TAB_TOUCH: buildTouchTab(); break;
-            case TAB_CHEATS: buildCheatsTab(); break;
             default: buildLanguageTab(); break;
         }
         mScroll.scrollTo(0, 0);
@@ -432,6 +417,24 @@ public final class SettingsMenu {
         choice("fps", Strings.t("fps_t"), Strings.t("fps_auto_n") + " " + Strings.t("changes_now"),
                 new String[] {"30", "45", "60", "auto"},
                 new String[] {"30 fps", "45 fps", "60 fps", Strings.t("fps_auto")}, "60");
+        choice("min_fps", Strings.t("minfps_t"), Strings.t("minfps_n") + " " + Strings.t("changes_now"),
+                new String[] {"15", "20", "30"}, new String[] {"15 fps", "20 fps", "30 fps"}, "20");
+        choice("scale_filter", Strings.t("scalef_t"), Strings.t("scalef_n") + " " + Strings.t("changes_now"),
+                new String[] {"0", "1"}, new String[] {Strings.t("scalef_0"), Strings.t("scalef_1")}, "1");
+        choice("upscaler", Strings.t("up_t"), Strings.t("up_n") + " " + Strings.t("changes_now"),
+                new String[] {"0", "1", "2"},
+                new String[] {Strings.t("up_0"), Strings.t("up_1"), Strings.t("up_2")}, "0");
+        choice("fsr_sharpness", Strings.t("sharp_t"), Strings.t("sharp_n") + " " + Strings.t("changes_now"),
+                new String[] {"100", "85", "70", "50", "30", "0"},
+                new String[] {"100%", "85%", "70%", "50%", "30%", "0%"}, "70");
+        choice("fxaa", Strings.t("fxaa_t"), Strings.t("fxaa_n") + " " + Strings.t("changes_now"),
+                new String[] {"0", "1", "2"},
+                new String[] {Strings.t("q_off"), Strings.t("fxaa_fast"), Strings.t("fxaa_quality")}, "0");
+        choice("hud_max_height", Strings.t("hudmax_t"), Strings.t("hudmax_n") + " " + Strings.t("changes_now"),
+                new String[] {"0", "1080", "720", "540"},
+                new String[] {Strings.t("hudmax_0"), "1080", "720", "540"}, "0");
+        toggle("hud_full_res", Strings.t("hudres_t"), Strings.t("hudres_n") + " " + Strings.t("changes_now"), "1", "0",
+                "1");
         choice("present_mode", Strings.t("present_t"), Strings.t("changes_next"),
                 new String[] {"fifo", "mailbox"},
                 new String[] {Strings.t("present_vsync") + " " + Strings.t("default_mark"), Strings.t("present_mailbox")},
@@ -448,10 +451,31 @@ public final class SettingsMenu {
         toggle("performance_mode", Strings.t("perf_t"), Strings.t("perf_n") + " " + Strings.t("changes_next"), "1", "0",
                 "0");
         renderScale();  // performance mode sets 75%; it can be moved freely afterwards
+        choice("shadow_quality", Strings.t("shadow_t"), Strings.t("shadow_n") + " " + Strings.t("changes_next"),
+                new String[] {"3", "2", "1", "0"},
+                new String[] {Strings.t("q_high"), Strings.t("q_medium"), Strings.t("q_low"), Strings.t("q_off")}, "3");
+        toggle("low_effects", Strings.t("loweff_t"), Strings.t("loweff_n") + " " + Strings.t("changes_next"), "1", "0",
+                "0");
+        toggle("skip_bloom", Strings.t("bloom_t"), Strings.t("bloom_n") + " " + Strings.t("changes_next"), "1", "0", "0");
+        toggle("skip_post", Strings.t("post_t"), Strings.t("post_n") + " " + Strings.t("changes_next"), "1", "0", "0");
+        toggle("skip_post_plus", Strings.t("postplus_t"), Strings.t("postplus_n") + " " + Strings.t("changes_next"), "1", "0",
+                "0");
+        choice("skip_hidden", Strings.t("hidden_t"), Strings.t("hidden_n") + " " + Strings.t("changes_now"),
+                new String[] {"0", "1", "2", "3"},
+                new String[] {Strings.t("q_off"), Strings.t("hidden_std"), Strings.t("hidden_ext"), Strings.t("hidden_max")}, "0");
+        toggle("skip_prepass", Strings.t("prepass_t"), Strings.t("prepass_n") + " " + Strings.t("changes_now"), "1", "0", "0");
+        choice("max_anisotropy", Strings.t("aniso_t"), Strings.t("aniso_n") + " " + Strings.t("changes_next"),
+                new String[] {"0", "1", "2", "4", "8", "16"},
+                new String[] {Strings.t("aniso_0"), Strings.t("aniso_off"), "2x", "4x", "8x", "16x"}, "0");
 
         section(Strings.t("sec_gpu"));
         note(Strings.t("gpu_n"));
         toggle("bc3_etc2", Strings.t("bc3_t"), Strings.t("bc3_n") + " " + Strings.t("changes_next"), "1", "0", "0");
+        toggle("bc_astc", Strings.t("astc_t"), Strings.t("astc_n") + " " + Strings.t("changes_next"), "1", "0", "0");
+        choice("astc_block", Strings.t("astcb_t"), Strings.t("astcb_n") + " " + Strings.t("changes_next"),
+                new String[] {"4", "6", "8"},
+                new String[] {Strings.t("astcb_4"), Strings.t("astcb_6"), Strings.t("astcb_8")}, "4");
+        toggle("bc5_astc", Strings.t("bc5_t"), Strings.t("bc5_n") + " " + Strings.t("changes_next"), "1", "0", "0");
         toggle("texture_mip_skip", Strings.t("mip_t"), Strings.t("mip_n") + " " + Strings.t("changes_next"), "1", "0",
                 "0");
         toggle("mali_barriers", Strings.t("malib_t"), Strings.t("malib_n") + " " + Strings.t("changes_next"), "1", "0",
@@ -605,8 +629,8 @@ public final class SettingsMenu {
 
     // ---- render scale -------------------------------------------------------------------------------------------
 
-    private static final float SCALE_MIN = 0.5f, SCALE_STEP = 0.05f;
-    private static final int SCALE_STEPS = 10;  // 0.5 .. 1.0
+    private static final float SCALE_MIN = 0.30f, SCALE_STEP = 0.05f;
+    private static final int SCALE_STEPS = 14;  // 0.30 .. 1.0
 
     /** The screen's long side / short side (what "Fill screen" uses). */
     private float screenAspect() {
@@ -631,9 +655,9 @@ public final class SettingsMenu {
             } catch (NumberFormatException ignored) {
             }
         }
-        float s = Math.max(0.5f, Math.min(1.0f, scale));
-        int h = Math.max(360, Math.min(720, Math.round(720f * s / 8f) * 8));
-        int w = Math.max(320, Math.min(1920, Math.round(h * aspect / 8f) * 8));
+        float s = Math.max(0.30f, Math.min(1.0f, scale));
+        int h = Math.max(216, Math.min(720, Math.round(720f * s / 8f) * 8));
+        int w = Math.max(216, Math.min(1920, Math.round(h * aspect / 8f) * 8));
         if (Math.abs(aspect - 16f / 9f) < 0.01f && h == 720) w = 1280;
         return new int[] {w, h};
     }
@@ -864,266 +888,6 @@ public final class SettingsMenu {
                 nativeMenuOpen(false);
             }
         });
-    }
-
-
-    // ---- Cheats tab ---------------------------------------------------------------------------------------------
-
-    private static final java.nio.charset.Charset UTF8 = java.nio.charset.StandardCharsets.UTF_8;
-
-    private static String str(byte[] b) {
-        return b == null ? "" : new String(b, UTF8);
-    }
-
-    private void buildCheatsTab() {
-        section(Strings.t("sec_cheats"));
-        String list;
-        try {
-            list = str(nativeCheats());
-        } catch (Throwable e) {
-            list = "";
-        }
-        if (list.isEmpty()) {
-            note(Strings.t("cheats_nogame"));
-            return;
-        }
-        String[] lines = list.split("\n");
-        String[] head = lines[0].split("\t", -1);
-        final String file = head.length > 2 ? head[2] : "";
-        final String folder = file.lastIndexOf('/') > 0 ? file.substring(0, file.lastIndexOf('/')) : file;
-        note(Strings.t("cheats_n", head.length > 1 ? head[1] : "?", file));
-        if (lines.length == 1) note(Strings.t("cheats_none"));
-        for (int i = 1; i < lines.length; i++) cheatRow(i - 1, lines[i].split("\t", -1));
-
-        section(Strings.t("sec_cheats_add"));
-        TextView imp = chip(Strings.t("cheat_import"), false);
-        imp.setGravity(Gravity.CENTER);
-        imp.setOnClickListener(v -> {
-            Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
-            i.addCategory(Intent.CATEGORY_OPENABLE);
-            i.setType("*/*");
-            try {
-                mA.startActivityForResult(i, REQ_CHEATS);
-            } catch (Exception e) {
-                popup(Strings.t("no_fm_t"), Strings.t("cheat_no_picker", folder));
-            }
-        });
-        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT);
-        lp.topMargin = dp(8);
-        mBody.addView(imp, lp);
-        TextView type = chip(Strings.t("cheat_type"), false);
-        type.setGravity(Gravity.CENTER);
-        type.setOnClickListener(v -> typeCheatDialog("", ""));
-        LinearLayout.LayoutParams tlp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT);
-        tlp.topMargin = dp(8);
-        mBody.addView(type, tlp);
-    }
-
-    /** One cheat: name, ON / OFF (master codes are always on; unusable ones say why). Long press: codes, delete. */
-    private void cheatRow(final int index, String[] f) {
-        final String name = f.length > 2 ? f[2] : "?";
-        final boolean master = f.length > 1 && "1".equals(f[1]);
-        final String error = f.length > 3 ? f[3] : "";
-        LinearLayout row = new LinearLayout(mA);
-        row.setOrientation(LinearLayout.HORIZONTAL);
-        row.setGravity(Gravity.CENTER_VERTICAL);
-        row.setPadding(dp(14), dp(10), dp(14), dp(10));
-        row.setFocusable(true);
-        row.setClickable(true);
-        row.setLongClickable(true);
-        StateListDrawable bg = new StateListDrawable();
-        bg.addState(new int[] {android.R.attr.state_focused}, rounded(0xFF3A3A3A, 10, 0xFFFFFFFF));
-        bg.addState(new int[] {android.R.attr.state_pressed}, rounded(0xFF3A3A3A, 10, 0));
-        bg.addState(new int[] {}, rounded(CARD, 10, 0));
-        row.setBackground(bg);
-        LinearLayout texts = new LinearLayout(mA);
-        texts.setOrientation(LinearLayout.VERTICAL);
-        texts.addView(text(name, 15, TEXT, true));
-        if (!error.isEmpty())
-            texts.addView(text(Strings.t("cheat_bad", error), 12, 0xFFE07A5F, false));
-        else if (master)
-            texts.addView(text(Strings.t("cheat_master"), 12, DIM, false));
-        row.addView(texts, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1));
-        final TextView state = new TextView(mA);
-        state.setTextSize(14);
-        state.setTypeface(Typeface.DEFAULT_BOLD);
-        state.setGravity(Gravity.CENTER);
-        state.setMinWidth(dp(64));
-        state.setPadding(dp(12), dp(6), dp(12), dp(6));
-        final boolean[] on = {f.length > 0 && "1".equals(f[0])};
-        final Runnable paint = () -> {
-            state.setText(!error.isEmpty() ? "—" : on[0] ? Strings.t("on") : Strings.t("off"));
-            state.setTextColor(on[0] ? 0xFF151515 : TEXT);
-            state.setBackground(rounded(on[0] ? GOLD : 0xFF444444, 14, 0));
-        };
-        paint.run();
-        LinearLayout.LayoutParams slp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT);
-        slp.leftMargin = dp(12);
-        row.addView(state, slp);
-        row.setOnClickListener(v -> {
-            if (master || !error.isEmpty()) {
-                cheatDialog(index, name);
-                return;
-            }
-            boolean ok;
-            try {
-                ok = nativeCheatSet(index, !on[0]);
-            } catch (Throwable e) {
-                ok = false;
-            }
-            if (!ok) {
-                showTab(TAB_CHEATS);  // the list changed underneath (e.g. a file was edited)
-                return;
-            }
-            on[0] = !on[0];
-            paint.run();
-        });
-        row.setOnLongClickListener(v -> {
-            cheatDialog(index, name);
-            return true;
-        });
-        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT);
-        lp.topMargin = dp(10);
-        mBody.addView(row, lp);
-    }
-
-    /** A cheat's codes, with Delete. */
-    private void cheatDialog(final int index, final String name) {
-        String codes;
-        try {
-            codes = str(nativeCheatText(index)).trim();
-        } catch (Throwable e) {
-            codes = "";
-        }
-        TextView t = text(codes, 13, TEXT, false);
-        t.setTypeface(Typeface.MONOSPACE);
-        t.setTextIsSelectable(true);
-        t.setPadding(dp(20), dp(8), dp(20), dp(8));
-        ScrollView sv = new ScrollView(mA);
-        sv.addView(t);
-        AlertDialog d = new AlertDialog.Builder(mA, android.R.style.Theme_DeviceDefault_Dialog_Alert)
-                .setTitle(name)
-                .setView(sv)
-                .setPositiveButton(Strings.t("close"), null)
-                .setNeutralButton(Strings.t("preset_delete"), (dlg, w) -> {
-                    boolean ok;
-                    try {
-                        ok = nativeCheatDelete(index);
-                    } catch (Throwable e) {
-                        ok = false;
-                    }
-                    if (ok) Toast.makeText(mA, Strings.t("preset_deleted", name), Toast.LENGTH_SHORT).show();
-                    else popup(Strings.t("tab_cheats"), Strings.t("cheat_del_failed"));
-                    if (mTab == TAB_CHEATS) showTab(TAB_CHEATS);
-                })
-                .create();
-        GameActivity.showImmersive(d);
-    }
-
-    /** Name and codes typed in; checked before they are saved (the dialog comes back with the problem). */
-    private void typeCheatDialog(String nameText, String codesText) {
-        final EditText name = new EditText(mA);
-        name.setSingleLine(true);
-        name.setHint(Strings.t("cheat_name"));
-        name.setText(nameText);
-        name.setTextColor(TEXT);
-        name.setHintTextColor(DIM);
-        final EditText codes = new EditText(mA);
-        codes.setHint(Strings.t("cheat_codes"));
-        codes.setText(codesText);
-        codes.setTypeface(Typeface.MONOSPACE);
-        codes.setMinLines(4);
-        codes.setGravity(Gravity.TOP | Gravity.START);
-        codes.setInputType(android.text.InputType.TYPE_CLASS_TEXT | android.text.InputType.TYPE_TEXT_FLAG_MULTI_LINE
-                | android.text.InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
-                | android.text.InputType.TYPE_TEXT_FLAG_CAP_CHARACTERS);
-        codes.setTextColor(TEXT);
-        codes.setHintTextColor(DIM);
-        LinearLayout box = new LinearLayout(mA);
-        box.setOrientation(LinearLayout.VERTICAL);
-        box.setPadding(dp(20), dp(8), dp(20), 0);
-        box.addView(name, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT));
-        box.addView(codes, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT));
-        ScrollView sv = new ScrollView(mA);
-        sv.addView(box);
-        AlertDialog d = new AlertDialog.Builder(mA, android.R.style.Theme_DeviceDefault_Dialog_Alert)
-                .setTitle(Strings.t("cheat_type"))
-                .setView(sv)
-                .setPositiveButton(Strings.t("save"), (dlg, w) -> {
-                    String n = name.getText().toString().replace('[', ' ').replace(']', ' ').trim();
-                    String c = codes.getText().toString().trim();
-                    if (n.isEmpty()) n = Strings.t("cheat_name");
-                    String block = "[" + n + "]\n" + c + "\n";
-                    String problem;
-                    try {
-                        problem = str(nativeCheatCheck(block.getBytes(UTF8)));
-                    } catch (Throwable e) {
-                        problem = e.toString();
-                    }
-                    if (!problem.isEmpty()) {
-                        final String fn = n;
-                        AlertDialog err = new AlertDialog.Builder(mA,
-                                android.R.style.Theme_DeviceDefault_Dialog_Alert)
-                                .setTitle(Strings.t("tab_cheats"))
-                                .setMessage(problem)
-                                .setPositiveButton(Strings.t("ok"), (x, y) -> typeCheatDialog(fn, c))
-                                .create();
-                        GameActivity.showImmersive(err);
-                        return;
-                    }
-                    addCheats(block);
-                })
-                .setNegativeButton(Strings.t("cancel"), null)
-                .create();
-        GameActivity.showImmersive(d);
-    }
-
-    private void importCheats(Uri uri) {
-        java.io.ByteArrayOutputStream buf = new java.io.ByteArrayOutputStream();
-        try (InputStream in = mA.getContentResolver().openInputStream(uri)) {
-            if (in == null) throw new IOException("cannot open the file");
-            byte[] b = new byte[1 << 16];
-            int n;
-            while ((n = in.read(b)) > 0) {
-                buf.write(b, 0, n);
-                if (buf.size() > (2 << 20)) throw new IOException("the file is larger than 2 MB");
-            }
-        } catch (IOException e) {
-            popup(Strings.t("tab_cheats"), e.getMessage());
-            return;
-        }
-        addCheats(new String(buf.toByteArray(), UTF8));
-    }
-
-    private void addCheats(String text) {
-        String r;
-        try {
-            r = str(nativeCheatAdd(text.getBytes(UTF8)));
-        } catch (Throwable e) {
-            r = e.toString();
-        }
-        if (mTab == TAB_CHEATS) showTab(TAB_CHEATS);
-        if (!r.startsWith("+")) {
-            popup(Strings.t("tab_cheats"), r);
-            return;
-        }
-        String[] p = r.substring(1).split("\t");
-        int added = 0, bad = 0;
-        try {
-            added = Integer.parseInt(p[0]);
-            bad = p.length > 1 ? Integer.parseInt(p[1]) : 0;
-        } catch (NumberFormatException ignored) {
-        }
-        if (bad > 0)
-            popup(Strings.t("tab_cheats"), Strings.t("cheats_added_bad", added, bad));
-        else
-            Toast.makeText(mA, Strings.t("cheats_added", added), Toast.LENGTH_SHORT).show();
     }
 
     // ---- Language tab -------------------------------------------------------------------------------------------

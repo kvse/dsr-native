@@ -14,6 +14,7 @@
 
 #if defined(__linux__)
 #include <sched.h>
+#include <sys/resource.h>
 #include <unistd.h>
 #endif
 
@@ -93,6 +94,11 @@ private:
         const long n = sysconf(_SC_NPROCESSORS_CONF);
         for (long c = 0; c < n && c < CPU_SETSIZE; c++) CPU_SET(c, &all);
         sched_setaffinity(0, sizeof(all), &all);  // best effort
+        // Texture conversion bursts (hundreds of BC levels when a zone loads) must not take the fast cores from the
+        // game's main thread and the render thread: on a 2 fast + 6 slow chip the logs showed multi-second stalls
+        // (render thread running but starved, 0 ms waiting for the GPU) exactly while those bursts ran. Nice 10 on
+        // Linux is per thread: the workers still use idle cores at full speed.
+        setpriority(PRIO_PROCESS, 0, 10);
 #endif
         uint64_t seen = 0;
         for (;;) {
