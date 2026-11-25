@@ -103,6 +103,11 @@ struct RuntimeConfig {
     // astc_block: 4, 6 or 8 (world textures; the HUD, text and small textures stay 4x4).
     bool bc_astc = false;
     int astc_block = 4;
+    // mali_bc (experimental, Mali GPUs only; the BC texture support of the malisx2 driver, which samples BC1-7 on
+    // Mali-G52 / G57 / G610): 0 = BC textures are used as they are when the driver reports them (else converted as
+    // above), 1 = the same after a test of every BC format (formats the driver does not report are then used as
+    // well), 2 = never: BC always converted (ASTC / ETC2 / decoded). Other GPUs ignore it.
+    int mali_bc = 0;
     // Diagnostics. shadow_compare: how the shadow map lookups compare (0 = the game's function as Vulkan's;
     // 1 = operands swapped; 2 = always 1 (shadowed); 3 = always 0 (lit)).
     int shadow_compare = 0;
