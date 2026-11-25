@@ -1780,6 +1780,11 @@ private:
         LOGI(kTag, "GPU: %s, Vulkan %u.%u.%u, driver 0x%x (%u.%u)", props_.deviceName, VK_VERSION_MAJOR(props_.apiVersion),
              VK_VERSION_MINOR(props_.apiVersion), VK_VERSION_PATCH(props_.apiVersion), props_.driverVersion,
              VK_VERSION_MAJOR(props_.driverVersion), VK_VERSION_MINOR(props_.driverVersion));
+        // mali_bc (Mali only, experimental; the BC support of the malisx2 driver): 0 = native BC when the driver
+        // reports it (malisx2 does on Mali-G52 / G57 / G610), 1 = the same after a test of every BC format (then BC
+        // textures are used as they are), 2 = never native BC on Mali: converted to ASTC / ETC2 / decoded.
+        is_mali_ = props_.vendorID == 0x13B5 || strstr(props_.deviceName, "Mali") != nullptr;
+        mali_bc_ = is_mali_ ? GetRuntime().config.mali_bc : 0;
         // Qualcomm's Adreno 6xx drivers (512.x before 512.514) do not expose the BC texture formats the GPU
         // supports; BCeNabler (libadrenotools) patches the driver in memory to expose them, which saves the
         // software decoding (and BC6H/BC7 then look right).
@@ -1816,7 +1821,7 @@ private:
         if (v13) have.pNext = &have13;
         vkGetPhysicalDeviceFeatures2(phys_, &have);
         VkPhysicalDeviceFeatures en{};
-        en.textureCompressionBC = have.features.textureCompressionBC;
+        en.textureCompressionBC = have.features.textureCompressionBC && mali_bc_ != 2;
         en.textureCompressionETC2 = have.features.textureCompressionETC2;
         en.textureCompressionASTC_LDR = have.features.textureCompressionASTC_LDR;
         en.samplerAnisotropy = have.features.samplerAnisotropy;
@@ -1929,7 +1934,7 @@ private:
         if (mali_barriers_)
             LOGI(kTag, "settings mali_barriers = 1: narrow layout barriers, render targets readable when their pass ends");
         // mali_tile_turbo (experimental, Mali only; from PR #73 by Dann-os3d): see LayoutScope.
-        const bool is_mali = props_.vendorID == 0x13B5 || strstr(props_.deviceName, "Mali") != nullptr;
+        const bool is_mali = is_mali_;
         tile_turbo_ = dsr::GetRuntime().config.mali_tile_turbo && is_mali;
         late_depth_ = dsr::GetRuntime().config.late_depth;
         no_bloom_ = dsr::GetRuntime().config.lighter_post_fx;
@@ -2403,7 +2408,8 @@ private:
     // memory and the sampling bandwidth). Images of each BC format are created here as a test; if all work, BC
     // textures are used as they are.
     void ProbePatchedBc() {
-        if (!bc_patched_) return;
+        if (is_mali_) LogMaliBc();
+        if (!bc_patched_ && mali_bc_ != 1) return;
         VkFormatProperties fp{};
         vkGetPhysicalDeviceFormatProperties(phys_, VK_FORMAT_BC1_RGBA_UNORM_BLOCK, &fp);
         static const VkFormat kFormats[] = {
@@ -2435,6 +2441,16 @@ private:
                     if (format_list_) ci.pNext = &fl;
                 }
                 VkImage image = VK_NULL_HANDLE;
+                // mali_bc = 1: the driver's own answers are truthful (malisx2), so a format it does not take is
+                // not even created (a driver may assert on a format it never offered).
+                if (!bc_patched_) {
+                    VkImageFormatProperties ifp{};
+                    if (vkGetPhysicalDeviceImageFormatProperties(phys_, f, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL,
+                                                                 ci.usage, ci.flags, &ifp) != VK_SUCCESS) {
+                        if (!failed++) first_failed = int(f);
+                        continue;
+                    }
+                }
                 const VkResult r = vkCreateImage(device_, &ci, nullptr, &image);
                 VkMemoryRequirements req{};
                 if (r == VK_SUCCESS) vkGetImageMemoryRequirements(device_, image, &req);
@@ -2445,9 +2461,32 @@ private:
             }
         }
         bc_forced_ = failed == 0;
-        LOGI(kTag, "BC textures: patched driver reports features 0x%x for BC1; test images: %s (%d failed, first format %d)%s",
-             fp.optimalTilingFeatures, failed ? "FAILED" : "ok", failed, first_failed,
-             bc_forced_ ? " - BC textures used as they are (not decoded)" : " - BC textures stay decoded on upload");
+        LOGI(kTag, "BC textures: %s reports features 0x%x for BC1; test images: %s (%d failed, first format %d)%s",
+             bc_patched_ ? "patched driver" : "Mali driver (mali_bc = 1)", fp.optimalTilingFeatures,
+             failed ? "FAILED" : "ok", failed, first_failed,
+             bc_forced_ ? " - BC textures used as they are (not decoded)"
+                        : " - BC textures stay converted (ASTC / ETC2) or decoded on upload");
+    }
+
+    // One line per run on Mali: what the driver says about BC and what mali_bc does with it.
+    void LogMaliBc() {
+        static const VkFormat kFormats[] = {
+            VK_FORMAT_BC1_RGBA_UNORM_BLOCK, VK_FORMAT_BC3_UNORM_BLOCK, VK_FORMAT_BC4_UNORM_BLOCK,
+            VK_FORMAT_BC5_UNORM_BLOCK,      VK_FORMAT_BC6H_UFLOAT_BLOCK, VK_FORMAT_BC7_UNORM_BLOCK};
+        const VkFormatFeatureFlags need = VK_FORMAT_FEATURE_TRANSFER_DST_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
+        char got[64];
+        size_t n = 0;
+        static const char* kNames[] = {"BC1", "BC3", "BC4", "BC5", "BC6H", "BC7"};
+        for (size_t i = 0; i < 6; i++) {
+            VkFormatProperties p{};
+            vkGetPhysicalDeviceFormatProperties(phys_, kFormats[i], &p);
+            if ((p.optimalTilingFeatures & need) == need)
+                n += size_t(snprintf(got + n, sizeof(got) - n, "%s%s", n ? " " : "", kNames[i]));
+        }
+        if (!n) snprintf(got, sizeof(got), "none");
+        LOGI(kTag, "BC textures on Mali: the driver samples %s (feature textureCompressionBC %d), mali_bc = %d (%s)", got,
+             int(features_.textureCompressionBC), mali_bc_,
+             mali_bc_ == 2 ? "never native: BC converted" : mali_bc_ == 1 ? "tested, then native" : "native when the driver has it");
     }
 
     // What a BC texture is converted into when the GPU cannot sample BC: ETC2 when the GPU has it (BC1 always;
@@ -2488,6 +2527,7 @@ private:
         VkFormat chosen = VK_FORMAT_UNDEFINED;
         VkFormatFeatureFlags feats = 0;
         for (VkFormat f : ImageCandidates(nvn_format)) {
+            if (mali_bc_ == 2 && BcKindOf(nvn_format) != BcKind::None) break;  // mali_bc = 2: BC is converted
             VkFormatProperties p;
             vkGetPhysicalDeviceFormatProperties(phys_, f, &p);
             // Driver patched by BCeNabler: BC images work, though the format query still reports nothing.
@@ -7799,6 +7839,8 @@ private:
         return !full;
     }
     bool bc_patched_ = false, bc_forced_ = false;
+    bool is_mali_ = false;       // a Mali GPU (vendor 0x13B5 or "Mali" in its name)
+    int mali_bc_ = 0;            // settings mali_bc (Mali only): 0 auto, 1 tested + native, 2 never native
     bool mip_skip_ = false;      // settings texture_mip_skip
     uint64_t mip_skipped_ = 0;   // images created without their top level
     int hud_box_w_ = 0, hud_box_h_ = 0;
