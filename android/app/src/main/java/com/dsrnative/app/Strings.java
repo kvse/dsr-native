@@ -260,6 +260,31 @@ final class Strings {
                 "Mali처럼 게임의 텍스처 형식이 없거나 타일 방식으로 그리는 GPU용입니다. 테스트할 때가 아니면 끄세요.",
                 "适用于 Mali 等缺少游戏纹理格式或以分块方式绘制的 GPU。除测试外请保持关闭。",
                 "適用於 Mali 等缺少遊戲紋理格式或以分塊方式繪製的 GPU。除測試外請保持關閉。");
+        put("malibc_t", "Native BC textures (malisx2, experimental)", "Textures BC natives (malisx2, expérimental)",
+                "Native BC-Texturen (malisx2, experimentell)", "Texture BC native (malisx2, sperimentale)",
+                "Texturas BC nativas (malisx2, experimental)", "Texturas BC nativas (malisx2, experimental)",
+                "Нативные текстуры BC (malisx2, экспериментально)", "ネイティブ BC テクスチャ (malisx2、実験的)",
+                "네이티브 BC 텍스처 (malisx2, 실험적)", "原生 BC 纹理（malisx2，实验性）", "原生 BC 紋理（malisx2，實驗性）");
+        put("malibc_n",
+                "For the malisx2 GPU driver, which samples BC1-7 itself on Mali-G52, G57 and G610. Auto: BC textures are used as they are when the driver reports them (no re-encoding, BC6H and BC7 look right, less CPU and memory). Tested: the same, after a test of every BC format. Off: always converted (ASTC / ETC2 / decoded), as with the system driver. Ignored on other GPUs; turn it off if textures look wrong.",
+                "Pour le pilote GPU malisx2, qui lit lui-même BC1-7 sur Mali-G52, G57 et G610. Auto : les textures BC sont utilisées telles quelles quand le pilote les signale (pas de réencodage, BC6H et BC7 s'affichent correctement, moins de CPU et de mémoire). Testé : pareil, après un test de chaque format BC. Désactivé : toujours converties (ASTC / ETC2 / décodées), comme avec le pilote système. Ignoré sur les autres GPU ; désactivez si les textures semblent incorrectes.",
+                "Für den GPU-Treiber malisx2, der BC1-7 auf Mali-G52, G57 und G610 selbst abtastet. Auto: BC-Texturen werden unverändert genutzt, wenn der Treiber sie meldet (keine Neukodierung, BC6H und BC7 sehen richtig aus, weniger CPU und Speicher). Getestet: dasselbe, nach einem Test jedes BC-Formats. Aus: immer umgewandelt (ASTC / ETC2 / dekodiert), wie beim System-Treiber. Auf anderen GPUs ohne Wirkung; ausschalten, wenn Texturen falsch aussehen.",
+                "Per il driver GPU malisx2, che campiona da solo BC1-7 su Mali-G52, G57 e G610. Auto: le texture BC vengono usate così come sono quando il driver le segnala (nessuna ricodifica, BC6H e BC7 si vedono bene, meno CPU e memoria). Testato: uguale, dopo un test di ogni formato BC. Disattivato: sempre convertite (ASTC / ETC2 / decodificate), come con il driver di sistema. Ignorato su altre GPU; disattiva se le texture sembrano sbagliate.",
+                "Para el controlador de GPU malisx2, que muestrea BC1-7 por sí mismo en Mali-G52, G57 y G610. Auto: las texturas BC se usan tal cual cuando el controlador las indica (sin recodificar, BC6H y BC7 se ven bien, menos CPU y memoria). Probado: lo mismo, tras una prueba de cada formato BC. Desactivado: siempre convertidas (ASTC / ETC2 / decodificadas), como con el controlador del sistema. Se ignora en otras GPU; desactívalo si las texturas se ven mal.",
+                "Para o driver de GPU malisx2, que amostra BC1-7 por conta própria em Mali-G52, G57 e G610. Auto: as texturas BC são usadas como estão quando o driver as informa (sem recodificar, BC6H e BC7 aparecem corretamente, menos CPU e memória). Testado: o mesmo, após um teste de cada formato BC. Desligado: sempre convertidas (ASTC / ETC2 / decodificadas), como com o driver do sistema. Ignorado em outras GPUs; desligue se as texturas parecerem erradas.",
+                "Для GPU-драйвера malisx2, который сам читает BC1-7 на Mali-G52, G57 и G610. Авто: текстуры BC используются как есть, если драйвер их сообщает (без перекодирования, BC6H и BC7 выглядят правильно, меньше нагрузка на CPU и память). Проверено: то же после проверки каждого формата BC. Выкл: всегда преобразуются (ASTC / ETC2 / декодирование), как с системным драйвером. На других GPU игнорируется; выключите, если текстуры выглядят неправильно.",
+                "malisx2 GPU ドライバー用です。Mali-G52、G57、G610 で BC1-7 を直接サンプリングします。自動: ドライバーが報告した場合、BC テクスチャをそのまま使います (再エンコードなし、BC6H と BC7 も正しく表示、CPU とメモリを節約)。テスト済み: 同じですが、各 BC 形式をテストしてから使います。オフ: 常に変換 (ASTC / ETC2 / デコード)、システムドライバーと同じです。他の GPU では無視されます。テクスチャがおかしい場合はオフにしてください。",
+                "malisx2 GPU 드라이버용입니다. Mali-G52, G57, G610에서 BC1-7을 직접 샘플링합니다. 자동: 드라이버가 보고하면 BC 텍스처를 그대로 사용합니다(재인코딩 없음, BC6H와 BC7도 올바르게 표시, CPU와 메모리 절약). 테스트됨: 같지만 각 BC 형식을 테스트한 뒤 사용합니다. 끄기: 항상 변환(ASTC / ETC2 / 디코딩), 시스템 드라이버와 같습니다. 다른 GPU에서는 무시됩니다. 텍스처가 이상하면 끄세요.",
+                "适用于 malisx2 GPU 驱动，它在 Mali-G52、G57 和 G610 上可直接采样 BC1-7。自动：驱动报告支持时直接使用 BC 纹理（无需重新编码，BC6H 和 BC7 显示正确，节省 CPU 和内存）。已测试：相同，但会先测试每种 BC 格式。关闭：始终转换（ASTC / ETC2 / 解码），与系统驱动相同。其他 GPU 上无效；如果纹理看起来不对，请关闭。",
+                "適用於 malisx2 GPU 驅動程式，它在 Mali-G52、G57 與 G610 上可直接取樣 BC1-7。自動：驅動程式回報支援時直接使用 BC 紋理（無需重新編碼，BC6H 與 BC7 顯示正確，節省 CPU 與記憶體）。已測試：相同，但會先測試每種 BC 格式。關閉：一律轉換（ASTC / ETC2 / 解碼），與系統驅動程式相同。其他 GPU 上無效；若紋理看起來不對，請關閉。");
+        put("malibc_0", "Auto", "Auto", "Auto", "Auto", "Auto", "Auto", "Авто", "自動", "자동", "自动", "自動");
+        put("malibc_1", "Tested (all BC formats)", "Testé (tous les formats BC)", "Getestet (alle BC-Formate)",
+                "Testato (tutti i formati BC)", "Probado (todos los formatos BC)", "Testado (todos os formatos BC)",
+                "Проверено (все форматы BC)", "テスト済み (全 BC 形式)", "테스트됨 (모든 BC 형식)", "已测试（所有 BC 格式）",
+                "已測試（所有 BC 格式）");
+        put("malibc_2", "Off (always convert)", "Désactivé (toujours convertir)", "Aus (immer umwandeln)",
+                "Disattivato (converti sempre)", "Desactivado (convertir siempre)", "Desligado (sempre converter)",
+                "Выкл (всегда преобразовывать)", "オフ (常に変換)", "끄기 (항상 변환)", "关闭（始终转换）", "關閉（一律轉換）");
         put("astc_t",
                 "ASTC textures",
                 "Textures ASTC",
