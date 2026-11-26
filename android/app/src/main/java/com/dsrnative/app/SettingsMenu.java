@@ -553,7 +553,17 @@ public final class SettingsMenu {
     // ---- Driver tab ---------------------------------------------------------------------------------------------
 
     // Drivers that come with the app (assets/drivers/<name>.zip; the native side copies them out of the APK).
-    private static final String[] BUNDLED_DRIVERS = {"Turnip_Gen8_V39"};
+    private static final String[] BUNDLED_DRIVERS = {"Turnip_Gen8_V39", "malisx2"};
+
+    // A bundled driver is offered only when its zip is really in the APK (malisx2.zip is added at build time).
+    private boolean hasBundledAsset(String name) {
+        try {
+            String[] f = mA.getAssets().list("drivers");
+            if (f != null) for (String x : f) if (x.equals(name + ".zip")) return true;
+        } catch (Exception ignored) {
+        }
+        return false;
+    }
 
     private static boolean isBundledDriver(String d) {
         for (String b : BUNDLED_DRIVERS) if (b.equals(d)) return true;
@@ -573,7 +583,7 @@ public final class SettingsMenu {
         if (chosen == null || chosen.isEmpty()) chosen = "system";
         List<String> drivers = new ArrayList<>();
         drivers.add("system");
-        for (String b : BUNDLED_DRIVERS) drivers.add(b);
+        for (String b : BUNDLED_DRIVERS) if (hasBundledAsset(b) || b.equals(chosen)) drivers.add(b);
         File dir = new File(sDriversDir);
         File[] files = dir.listFiles();
         if (files != null) {
