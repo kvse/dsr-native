@@ -595,7 +595,7 @@ static void TestAbi() {
 // ASTC encoder tests from pull request #47 (fernanfez00).
 static void TestAstcEncode() {
     using namespace dsr::hle::nvn;
-    CHECK(IsAstcEncodable(65) && IsAstcEncodable(72) && !IsAstcEncodable(73) && !IsAstcEncodable(77));
+    CHECK(IsAstcEncodable(65) && IsAstcEncodable(72) && !IsAstcEncodable(73) && IsAstcEncodable(77) && IsAstcEncodable(78) && !IsAstcEncodable(79));
     CHECK(AstcLevelBytes(37, 29, 1) == size_t(10) * 8 * 16 && AstcLevelBytes(1, 1, 1) == 16);
     const int W = 37, H = 29;  // edges not on block boundaries
     uint32_t seed = 11;
