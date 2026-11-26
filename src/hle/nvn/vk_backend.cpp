@@ -1880,7 +1880,17 @@ private:
         }
         LoadDeviceFunctions(device_);
         ProbePatchedBc();
-        dsr::SetGpuHasBc(features_.textureCompressionBC || bc_forced_);
+        // A driver may take BC formats one by one without the global feature (malisx2 0.6 on Mali-G57 does for
+        // BC1 / BC3): that GPU has BC too (performance mode then does not force texture_mip_skip on).
+        bool native_bc = false;
+        if (mali_bc_ != 2)
+            for (VkFormat f : {VK_FORMAT_BC1_RGBA_UNORM_BLOCK, VK_FORMAT_BC3_UNORM_BLOCK}) {
+                VkFormatProperties p;
+                vkGetPhysicalDeviceFormatProperties(phys_, f, &p);
+                const VkFormatFeatureFlags need = VK_FORMAT_FEATURE_TRANSFER_DST_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
+                if ((p.optimalTilingFeatures & need) == need) native_bc = true;
+            }
+        dsr::SetGpuHasBc(features_.textureCompressionBC || bc_forced_ || native_bc);
         mip_skip_ = dsr::GetRuntime().config.texture_mip_skip > 0;
         load_skip_ = dsr::GetRuntime().config.pass_load_skip;
         ChooseStagingMemory();
@@ -2557,9 +2567,6 @@ private:
                      : to == BcTo::AstcLa ? "re-encoded as ASTC luminance + alpha (dual plane)"
                                           : "re-encoded as ETC2",
                      int(f));
-                if (BcKindOf(nvn_format) == BcKind::BC7 || BcKindOf(nvn_format) == BcKind::BC6H_S ||
-                    BcKindOf(nvn_format) == BcKind::BC6H_U)
-                    LOGW(kTag, "NVN format %d: decoding not implemented yet, shown as grey", nvn_format);
             }
         }
         if (chosen == VK_FORMAT_UNDEFINED) LOGW(kTag, "NVN format %d has no usable Vulkan format yet", nvn_format);

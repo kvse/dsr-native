@@ -6,7 +6,10 @@
 
 namespace dsr::hle::nvn {
 
-bool IsAstcEncodable(int f) { return f == 65 || f == 66 || f == 69 || f == 70 || f == 68 || f == 72; }
+// BC1 / BC3 and BC7 (77 / 78: decoded by software, then 1 byte per texel as ASTC 4x4 instead of 4 as RGBA8).
+bool IsAstcEncodable(int f) {
+    return f == 65 || f == 66 || f == 69 || f == 70 || f == 68 || f == 72 || f == 77 || f == 78;
+}
 
 bool IsAstcLaEncodable(int f) { return f == 75; }
 
