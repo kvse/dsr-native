@@ -390,7 +390,7 @@ std::string g_custom_game_dir;  // settings.txt `game_dir`: a game folder the pl
 #define GPU_DRIVER_HELP                                                                                      \
     "# gpu_driver: system = the phone's own Vulkan driver; or the name of a file in the drivers folder next\n" \
     "# to this file: a driver .zip as made for AdrenoTools (e.g. Mesa Turnip) or a bare .so\n"                 \
-    "# (e.g. gpu_driver = turnip.zip), or a driver that comes with the app: Turnip_Gen8_V39 (Adreno).\n" \
+    "# (e.g. gpu_driver = turnip.zip), or a driver that comes with the app: Turnip_Gen8_V39 (Adreno), malisx2 (Mali, native BC textures).\n" \
     "# If it cannot be loaded, the system driver is used.\n"
 #define BC_ENABLER_HELP                                                                                      \
     "# bc_enabler: 1 = on Adreno 6xx system drivers, patch in the compressed (BC) texture formats the GPU\n"   \
@@ -892,7 +892,7 @@ std::vector<std::string> Unzip(const std::string& zip, const std::string& dir, c
 }
 
 // GPU drivers that come with the app (android/app/src/main/assets/drivers/<name>.zip; licence notes beside them).
-const char* const kBundledDrivers[] = {"Turnip_Gen8_V39"};
+const char* const kBundledDrivers[] = {"Turnip_Gen8_V39", "malisx2"};
 
 // settings.txt `gpu_driver`: the file in <base>/drivers is copied (a .so) or unpacked (a .zip) into the app's
 // private folder, since libraries cannot be loaded from shared storage. Sets cfg->gpu_driver_dir/_lib.
