@@ -13,6 +13,7 @@
     X(vkGetPhysicalDeviceProperties)              \
     X(vkGetPhysicalDeviceFeatures2)               \
     X(vkGetPhysicalDeviceFormatProperties)        \
+    X(vkGetPhysicalDeviceImageFormatProperties)   \
     X(vkGetPhysicalDeviceMemoryProperties)        \
     X(vkGetPhysicalDeviceQueueFamilyProperties)   \
     X(vkGetPhysicalDeviceSurfaceCapabilitiesKHR)  \
